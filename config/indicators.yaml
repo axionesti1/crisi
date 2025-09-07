@@ -1,0 +1,32 @@
+exposure:
+  heat_tmax_delta:
+    direction: higher_is_worse
+    weight: 0.5
+  heatwave_days:
+    direction: higher_is_worse
+    weight: 0.5
+  drought_spei:
+    direction: lower_is_worse
+    weight: 1.0
+
+sensitivity:
+  tourism_gdp_share:
+    direction: higher_is_worse
+    weight: 0.6
+  seasonality_idx:
+    direction: higher_is_worse
+    weight: 0.4
+
+adaptive_capacity:
+  readiness_proxy:
+    direction: higher_is_better
+    weight: 1.0
+
+pillars:
+  alpha: 0.45
+  beta: 0.35
+  gamma: 0.20
+
+priority_rule:
+  tourism_gdp_share_gt: 0.50
+  projected_drop_gt: 0.20

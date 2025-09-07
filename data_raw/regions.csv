@@ -1,0 +1,4 @@
+region_id,region_name,lat,lon
+R1,Region A,43.0,-7.5
+R2,Region B,47.5,12.5
+R3,Region C,52.5,22.5

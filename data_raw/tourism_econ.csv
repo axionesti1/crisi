@@ -1,0 +1,4 @@
+region_id,tourism_gdp_share,seasonality_idx,projected_drop,readiness_proxy,region_name
+R1,0.35,0.6,0.1,0.6,Region A
+R2,0.15,0.4,0.05,0.8,Region B
+R3,0.55,0.8,0.25,0.4,Region C

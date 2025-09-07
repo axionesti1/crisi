@@ -1,0 +1,7 @@
+region_id,scenario,heat_tmax_delta,heatwave_days,drought_spei
+R1,rcp45,2.0,10,-1.0
+R2,rcp45,1.5,8,-0.5
+R3,rcp45,3.0,15,-1.5
+R1,rcp85,2.5,12,-1.2
+R2,rcp85,2.0,9,-0.7
+R3,rcp85,3.5,18,-1.8

@@ -1,0 +1,12 @@
+streamlit
+pydeck
+pandas
+numpy
+geopandas
+pyyaml
+scikit-learn
+xarray
+rasterio
+rioxarray
+pyproj
+shapely
