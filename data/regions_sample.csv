@@ -1,0 +1,4 @@
+region,nuts3_code,lat,lon,arrivals_per_capita,seasonality_index,climate_risk,infra_score,income_dependency,unemployment_rate
+Cyclades,EL422,37.05,25.20,2.10,0.78,0.62,0.55,0.48,0.14
+Dodecanese,EL421,36.44,27.98,1.85,0.72,0.58,0.60,0.52,0.12
+Thessaloniki,EL522,40.64,22.94,0.95,0.40,0.35,0.70,0.35,0.11
