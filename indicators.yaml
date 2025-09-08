@@ -1,0 +1,16 @@
+scenarios:
+  baseline:
+    arrivals_per_capita: {weight: 0.25, benefit: true}
+    seasonality_index:   {weight: 0.15, benefit: false}
+    climate_risk:        {weight: 0.20, benefit: false}
+    infra_score:         {weight: 0.20, benefit: true}
+    income_dependency:   {weight: 0.10, benefit: false}
+    unemployment_rate:   {weight: 0.10, benefit: false}
+
+  resilience_push:
+    arrivals_per_capita: {weight: 0.15, benefit: true}
+    seasonality_index:   {weight: 0.20, benefit: false}
+    climate_risk:        {weight: 0.30, benefit: false}
+    infra_score:         {weight: 0.20, benefit: true}
+    income_dependency:   {weight: 0.10, benefit: false}
+    unemployment_rate:   {weight: 0.05, benefit: false}
