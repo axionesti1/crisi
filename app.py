@@ -148,9 +148,11 @@ top_regions = ref[ref["horizon_years"] == latest].nlargest(topn, "score")["regio
 line_df = scored_long[scored_long["region"].isin(top_regions)].copy()
 line_df = line_df.pivot_table(index=["region","scenario","horizon_years"], values="score").reset_index()
 line_df = line_df.sort_values(["region","scenario","horizon_years"])
-st.line_chart(
-    line_df.pivot_table(index="horizon_years", columns=["region","scenario"], values="score")
-)
+chart_df = line_df.pivot_table(index="horizon_years", columns=["region","scenario"], values="score")
+# flatten MultiIndex columns so Streamlit can handle them
+if isinstance(chart_df.columns, pd.MultiIndex):
+    chart_df.columns = [f"{r} ({s})" for r, s in chart_df.columns.to_list()]
+st.line_chart(chart_df)
 
 st.subheader("Top Regions (bar, latest horizon per scenario)")
 bar_scope = scored_long[scored_long["horizon_years"] == latest]
