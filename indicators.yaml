@@ -1,16 +1,60 @@
+# Global horizons (years ahead) used for charts & scoring projections
+horizons: [5, 10, 15, 20, 25, 30]
+
+# Base indicator weights (used by baseline)
+weights:
+  arrivals_per_capita: 0.25
+  seasonality_index:   0.15
+  climate_risk:        0.20
+  infra_score:         0.20
+  income_dependency:   0.10
+  unemployment_rate:   0.10
+
+# Whether higher is better (true) or worse (false)
+benefit:
+  arrivals_per_capita: true
+  seasonality_index:   false
+  climate_risk:        false
+  infra_score:         true
+  income_dependency:   false
+  unemployment_rate:   false
+
+# Scenario definitions
 scenarios:
   baseline:
-    arrivals_per_capita: {weight: 0.25, benefit: true}
-    seasonality_index:   {weight: 0.15, benefit: false}
-    climate_risk:        {weight: 0.20, benefit: false}
-    infra_score:         {weight: 0.20, benefit: true}
-    income_dependency:   {weight: 0.10, benefit: false}
-    unemployment_rate:   {weight: 0.10, benefit: false}
+    type: baseline
+    weights_override: {}
 
-  resilience_push:
-    arrivals_per_capita: {weight: 0.15, benefit: true}
-    seasonality_index:   {weight: 0.20, benefit: false}
-    climate_risk:        {weight: 0.30, benefit: false}
-    infra_score:         {weight: 0.20, benefit: true}
-    income_dependency:   {weight: 0.10, benefit: false}
-    unemployment_rate:   {weight: 0.05, benefit: false}
+  rcp45:
+    type: rcp
+    climate_multiplier_per_10y: 0.95
+    weights_override: {}
+
+  rcp85:
+    type: rcp
+    climate_multiplier_per_10y: 1.15
+    weights_override: {}
+
+  strict_strict:
+    type: foresight
+    regulation: strict
+    technology: strict
+    weights_override: {}
+
+  easy_easy:
+    type: foresight
+    regulation: easy
+    technology: easy
+    weights_override: {}
+
+  strict_easy:
+    type: foresight
+    regulation: strict
+    technology: easy
+    weights_override: {}
+
+  easy_strict:
+    type: foresight
+    regulation: easy
+    technology: strict
+    weights_override: {}
