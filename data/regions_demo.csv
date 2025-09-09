@@ -1,9 +1,0 @@
-region,nuts3_code,lat,lon,arrivals_per_capita,seasonality_index,climate_risk,infra_score,income_dependency,unemployment_rate
-Cyclades,EL422,37.05,25.20,2.30,0.85,0.70,0.58,0.55,0.12
-Dodecanese,EL421,36.44,27.98,1.90,0.78,0.66,0.62,0.50,0.11
-Thessaloniki,EL522,40.64,22.94,0.95,0.40,0.38,0.70,0.35,0.10
-Chania,EL434,35.51,24.02,1.60,0.65,0.55,0.64,0.45,0.09
-Corfu,EL623,39.62,19.92,1.75,0.72,0.60,0.60,0.52,0.12
-Lesvos,EL411,39.10,26.56,0.80,0.55,0.50,0.57,0.40,0.13
-Rhodes,EL421R,36.16,27.86,2.10,0.82,0.68,0.63,0.53,0.10
-Kavala,EL511,40.94,24.41,1.10,0.50,0.45,0.59,0.42,0.12
