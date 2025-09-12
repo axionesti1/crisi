@@ -1,6 +1,6 @@
 import streamlit as st
-from modules.scenarios import run_scenarios
-from modules.cba import run_cba
+from scenarios import run_scenarios
+from cba import run_cba
 
 st.title("CRISI: Climate Resilience Investment Scoring Intelligence")
 
