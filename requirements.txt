@@ -2,8 +2,7 @@ streamlit
 scikit-learn  
 xgboost  
 shap  
-cdsapi  
-pandaSDMX  
+cdsapi   
 wbdata  
 requests  
 geopandas  
