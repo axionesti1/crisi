@@ -31,121 +31,122 @@ st.write("This app links climate hazards with tourism economics to assess the re
 @st.cache_data(show_spinner=True)
 def load_eurostat_data(year=2019):
     """
-    Fetch tourism & economic data from Eurostat REST API (no pandasdmx).
-    - tour_occ_nin2: nights spent at tourist accommodation (NUTS2)
-    - nama_10r_2gdp: regional GDP (Mio EUR, NUTS2)
-    Returns: DataFrame with columns [region_code, tourist_nights, gdp_meur]
+    Fetch tourism & GDP data from Eurostat REST API (no pandasdmx).
+    - tour_occ_nin2: nights spent at tourist accommodations (NUTS2)
+    - nama_10r_2gdp: regional GDP (NUTS2)
+    Returns: DataFrame [region_code, tourist_nights, gdp_meur]
     """
-    import itertools
+    import requests
+    import pandas as pd
 
-    def fetch_jsonstat(dataset_code, params):
-        base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/JSON/en/"
-        url = base + dataset_code
+    BASE = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/data/"
+
+    def fetch_jsonstat(dataset, params):
+        # New Eurostat endpoint – no language segment; returns SDMX-JSON
+        url = BASE + dataset
         r = requests.get(url, params=params, timeout=60)
         r.raise_for_status()
         return r.json()
 
     def jsonstat_to_df(js):
-        # Parse JSON-stat (Eurostat v1.0) into a flat DataFrame of dimension codes + value
-        dim = js["dimension"]
-        dim_ids = js["id"] if "id" in js else list(dim.keys())
-        categories = {d: dim[d]["category"] for d in dim_ids}
-        # ordered codes per dimension
-        code_lists = {
-            d: [c for c, _ in sorted(categories[d]["index"].items(), key=lambda kv: kv[1])]
+        # Generic SDMX-JSON → DataFrame
+        dim_ids = js.get("id") or list(js["dimension"].keys())
+        cats = {d: js["dimension"][d]["category"] for d in dim_ids}
+        codes_by_dim = {
+            d: [code for code, _idx in sorted(cats[d]["index"].items(), key=lambda kv: kv[1])]
             for d in dim_ids
         }
-        # total size (cartesian product)
-        sizes = [len(code_lists[d]) for d in dim_ids]
-        # values can be dense list or sparse dict
-        values = js["value"]
-        records = []
+        sizes = [len(codes_by_dim[d]) for d in dim_ids]
+        vals = js["value"]
+        recs = []
 
-        if isinstance(values, list):
-            # dense array (length == product of sizes)
-            for flat_idx, v in enumerate(values):
+        def decode(flat_idx):
+            idxs = []
+            n = flat_idx
+            for size in reversed(sizes):
+                idxs.append(n % size)
+                n //= size
+            idxs.reverse()
+            rec = {}
+            for d, i in zip(dim_ids, idxs):
+                rec[d] = codes_by_dim[d][i]
+            return rec
+
+        if isinstance(vals, list):
+            for i, v in enumerate(vals):
                 if v is None:
                     continue
-                idxs = []
-                n = flat_idx
-                # decode flat index into multi-index
-                for size in reversed(sizes):
-                    idxs.append(n % size)
-                    n //= size
-                idxs = list(reversed(idxs))
-                rec = {}
-                for d, i in zip(dim_ids, idxs):
-                    rec[d] = code_lists[d][i]
+                rec = decode(i)
                 rec["value"] = v
-                records.append(rec)
+                recs.append(rec)
         else:
-            # sparse dict {flat_idx_str: value}
-            for flat_idx_str, v in values.items():
+            for k, v in vals.items():
                 if v is None:
                     continue
-                flat_idx = int(flat_idx_str)
-                idxs = []
-                n = flat_idx
-                for size in reversed(sizes):
-                    idxs.append(n % size)
-                    n //= size
-                idxs = list(reversed(idxs))
-                rec = {}
-                for d, i in zip(dim_ids, idxs):
-                    rec[d] = code_lists[d][i]
+                rec = decode(int(k))
                 rec["value"] = v
-                records.append(rec)
+                recs.append(rec)
 
-        return pd.DataFrame.from_records(records)
+        df = pd.DataFrame.from_records(recs)
+        # standardize common cols
+        if "geo" in df.columns:
+            df = df.rename(columns={"geo": "region_code"})
+        if "time" in df.columns:
+            df = df.rename(columns={"time": "year"})
+            # make year int if it looks like one
+            with pd.option_context("mode.chained_assignment", None):
+                df["year"] = pd.to_numeric(df["year"], errors="ignore")
+        return df
 
-    # --- Nights spent at tourist accommodation (NUTS2) ---
-    # dataset: tour_occ_nin2
-    # filters: unit=NR (number), and time=year
-    nights_js = fetch_jsonstat(
-        "tour_occ_nin2",
-        {"time": str(year), "unit": "NR"}
-    )
+    # ---- Nights spent (tour_occ_nin2) ----
+    # Keep params minimal; Eurostat 404s if you pass invalid filters.
+    nights_js = fetch_jsonstat("tour_occ_nin2", {"time": str(year)})
     df_n = jsonstat_to_df(nights_js)
-    # standardize column names
-    if "geo" in df_n.columns:
-        df_n.rename(columns={"geo": "region_code"}, inplace=True)
-    if "time" in df_n.columns:
-        df_n.rename(columns={"time": "year"}, inplace=True)
-    df_n = df_n[["region_code", "year", "value"]]
+
+    # Filter/aggregate to a single 'total' slice if extra dims exist
+    keep_cols = {"region_code", "year", "value"}
+    extra_dims = [c for c in df_n.columns if c not in keep_cols]
+    # Prefer any 'TOTAL'-like codes if present; otherwise pick the first category to avoid double counting
+    pref_totals = {"TOTAL", "TOT", "ALL"}
+    for c in extra_dims:
+        if df_n[c].isin(pref_totals).any():
+            df_n = df_n[df_n[c].isin(pref_totals)]
+        else:
+            first_code = df_n[c].iloc[0]
+            df_n = df_n[df_n[c] == first_code]
     df_n = df_n.rename(columns={"value": "tourist_nights"})
-    # keep only NUTS2 (Eurostat codes are like EL30, DE60 etc.; ensure length >=4 and no “TOTAL”)
-    df_n = df_n[df_n["region_code"].str.len().ge(4)].copy()
+    df_n = df_n[["region_code", "tourist_nights"]]
+    # NUTS2 codes are typically ≥4 chars (e.g., EL30, DE21). Keep those.
+    df_n = df_n[df_n["region_code"].str.len().ge(4)]
 
-    # --- Regional GDP at current market prices (NUTS2) ---
-    # dataset: nama_10r_2gdp (value in million EUR)
-    gdp_js = fetch_jsonstat(
-        "nama_10r_2gdp",
-        {"time": str(year)}
-    )
+    # ---- Regional GDP (nama_10r_2gdp) ----
+    # Again, minimal params (just time). We'll filter to the main GDP concept afterward.
+    gdp_js = fetch_jsonstat("nama_10r_2gdp", {"time": str(year)})
     df_g = jsonstat_to_df(gdp_js)
+
+    # Try to prefer main GDP concept & unit if present
+    # Common codes: na_item='B1GQ' (GDP) and unit like 'MIO_EUR' or 'CP_MEUR' depending on dataset.
+    for col, desired in (("na_item", {"B1GQ"}), ("unit", {"MIO_EUR", "CP_MEUR", "MIO_NAC"})):
+        if col in df_g.columns:
+            if df_g[col].isin(desired).any():
+                df_g = df_g[df_g[col].isin(desired)]
+            else:
+                # fallback: first category
+                df_g = df_g[df_g[col] == df_g[col].iloc[0]]
+
     if "geo" in df_g.columns:
-        df_g.rename(columns={"geo": "region_code"}, inplace=True)
-    if "time" in df_g.columns:
-        df_g.rename(columns={"time": "year"}, inplace=True)
-    df_g = df_g[["region_code", "year", "value"]]
+        df_g = df_g.rename(columns={"geo": "region_code"})
     df_g = df_g.rename(columns={"value": "gdp_meur"})
-    df_g = df_g[df_g["region_code"].str.len().ge(4)].copy()
+    df_g = df_g[df_g["region_code"].str.len().ge(4)]
+    df_g = df_g[["region_code", "gdp_meur"]]
 
-    # Merge on region_code
-    df = pd.merge(
-        df_n[["region_code", "tourist_nights"]],
-        df_g[["region_code", "gdp_meur"]],
-        on="region_code",
-        how="inner"
-    )
+    # Merge
+    out = pd.merge(df_n, df_g, on="region_code", how="inner")
+    out["tourist_nights"] = pd.to_numeric(out["tourist_nights"], errors="coerce")
+    out["gdp_meur"] = pd.to_numeric(out["gdp_meur"], errors="coerce")
+    out = out.dropna(subset=["tourist_nights", "gdp_meur"]).reset_index(drop=True)
+    return out
 
-    # basic sanity cast
-    df["tourist_nights"] = pd.to_numeric(df["tourist_nights"], errors="coerce")
-    df["gdp_meur"] = pd.to_numeric(df["gdp_meur"], errors="coerce")
-
-    # Drop NAs
-    df = df.dropna(subset=["tourist_nights", "gdp_meur"]).reset_index(drop=True)
-    return df
 
 
 @st.cache_data(show_spinner=True)
