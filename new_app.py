@@ -5,8 +5,6 @@ import requests
 import json
 
 # For data APIs
-
-import wbdata                # World Bank data
 import cdsapi                # Copernicus Climate Data Store API
 
 # For ML
@@ -148,32 +146,60 @@ def load_eurostat_data(year=2019):
     return out
 
 
-
 @st.cache_data(show_spinner=True)
-def load_worldbank_data(year=2019):
-    """Fetch country-level socio-economic indicators from World Bank for given year."""
-    # Define indicators to fetch
+def load_worldbank_data(year: int, country_codes_iso2: list[str]) -> dict:
+    """
+    Fetch World Bank indicators for specified ISO2 countries via REST API.
+    Returns: dict like {"GR": {"population": 10_482_487, "gdp_per_capita": 19876.5}, ...}
+    """
+    import math
+
     indicators = {
-        'SP.POP.TOTL': 'population',
-        'NY.GDP.PCAP.CD': 'gdp_per_capita'
-        # (Add more indicators as needed, e.g. tourism % GDP if available)
+        "SP.POP.TOTL": "population",
+        "NY.GDP.PCAP.CD": "gdp_per_capita",
     }
-    # Fetch data for all countries for the specified year
-    df_wb = wbdata.get_dataframe(indicators, country='all', data_date=str(year))
-    df_wb = df_wb.reset_index()
-    # The DataFrame typically has columns: country, date, indicator values
-    df_wb = df_wb[df_wb['date'] == year]  # filter the year if needed
-    df_wb = df_wb[['country', 'population', 'gdp_per_capita']]
-    # Country codes in wbdata might be ISO3 or ISO2 country codes. We'll assume ISO2 for mapping.
-    # Create a lookup from country code to indicators
-    country_data = {}
-    for _, row in df_wb.iterrows():
-        country_code = str(row['country']).upper()
-        country_data[country_code] = {
-            'population': row['population'],
-            'gdp_per_capita': row['gdp_per_capita']
-        }
-    return country_data
+
+    # WB API allows multiple countries separated by ';' (ISO2 code expected in 'country.id')
+    country_param = ";".join(sorted(set(cc.upper() for cc in country_codes_iso2)))
+
+    base = "https://api.worldbank.org/v2/country/{countries}/indicator/{indicator}"
+    params = {"date": str(year), "format": "json", "per_page": "20000"}
+
+    store: dict[str, dict] = {}
+
+    for ind_code, out_name in indicators.items():
+        url = base.format(countries=country_param, indicator=ind_code)
+        resp = requests.get(url, params=params, timeout=60)
+        resp.raise_for_status()
+        js = resp.json()
+
+        # Response format: [metadata, data_list]
+        if not isinstance(js, list) or len(js) < 2 or js[1] is None:
+            # No data available; continue with NAs
+            continue
+
+        for row in js[1]:
+            # row['country']['id'] is ISO2
+            try:
+                iso2 = row["country"]["id"]
+            except Exception:
+                continue
+            val = row.get("value", None)
+            # Coerce to float where possible
+            if val is None:
+                num = math.nan
+            else:
+                try:
+                    num = float(val)
+                except Exception:
+                    num = math.nan
+
+            if iso2 not in store:
+                store[iso2] = {}
+            store[iso2][out_name] = num
+
+    return store
+
 
 @st.cache_data(show_spinner=True)
 def load_climate_data():
@@ -194,7 +220,17 @@ with st.spinner("Loading data from Eurostat and World Bank..."):
     except Exception as e:
         st.error(f"Error fetching Eurostat data: {e}")
         st.stop()
-    country_stats = load_worldbank_data(year=2019)
+
+    # derive ISO2 from NUTS2 (first 2 chars; map exceptions)
+    def map_country_code(nuts_code):
+        cc = nuts_code[:2].upper()
+        cc_map = {'EL': 'GR', 'UK': 'GB'}  # NUTS->ISO2 fixes
+        return cc_map.get(cc, cc)
+
+    data["country_code"] = data["region_code"].apply(map_country_code)
+
+    unique_countries = sorted(data["country_code"].dropna().unique().tolist())
+    country_stats = load_worldbank_data(year=2019, country_codes_iso2=unique_countries)
 
 # Merge country-level data into regional dataframe
 # Assume region_code first 2 letters correspond to country (NUTS2).
