@@ -90,7 +90,7 @@ with st.sidebar:
     scenario_key_map = {}
     for key, sc in scenario_configs.items():
         stype = sc.get("type", "").lower()
-              if stype in ("baseline", "rcp", "foresight"):
+        if stype in ("baseline", "rcp", "foresight"):
             if stype == "rcp":
                 name = key.upper()
                 if key == "rcp45":
@@ -99,14 +99,10 @@ with st.sidebar:
                     name = "RCP 8.5"
             elif stype == "baseline":
                 name = "Baseline"
-            else:
-                name = key.replace("_", " ").title()
-            scenario_names.append(name)
-            scenario_key_map[name] = key
             elif stype == "foresight":
-            reg = sc.get("regulation", "").capitalize()
-            tech = sc.get("technology", "").capitalize()
-            name = f"{reg} / {tech}"
+                reg = sc.get("regulation", "").capitalize()
+                tech = sc.get("technology", "").capitalize()
+                name = f"{reg} / {tech}"
             scenario_names.append(name)
             scenario_key_map[name] = key
     if not scenario_names:
@@ -304,7 +300,7 @@ data['climate_risk'] = data['norm_baseline_temp']
 if stype == "rcp":
     mult10 = float(scen_cfg.get("climate_multiplier_per_10y", 1.0))
     factor = mult10 ** (years_forward / 10.0)
-     data['climate_risk'] = data['climate_risk'] * factor
+    data['climate_risk'] = data['climate_risk'] * factor
 elif stype == "foresight":
     data = apply_foresight(
         data,
