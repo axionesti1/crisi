@@ -5,7 +5,7 @@ import requests
 import json
 
 # For data APIs
-import pandasdmx as sdmx      # Eurostat SDMX client
+
 import wbdata                # World Bank data
 import cdsapi                # Copernicus Climate Data Store API
 
@@ -30,46 +30,123 @@ st.write("This app links climate hazards with tourism economics to assess the re
 
 @st.cache_data(show_spinner=True)
 def load_eurostat_data(year=2019):
-    """Fetch tourism and economic data from Eurostat for a given year."""
-    estat = sdmx.Request('ESTAT')
-    # Example: Nights spent at tourist accommodations by NUTS2 region
-    data_flow = 'tour_occ_nin2'  # dataset code for tourist nights (annual)
-    params = {'time': str(year)}  # filter by year
-    # Retrieve all regions by not specifying 'geo' key (could also specify geo=ALL or chunk by country)
-    resp = estat.data(data_flow, params=params)
-    df_nights = resp.to_pandas()  # Convert SDMX to pandas DataFrame
-    # The DataFrame might have multi-index columns (e.g., units, geo). We reset index for clarity.
-    df_nights = df_nights.reset_index()
-    # Typically, Eurostat data will have columns like GEO and TIME_PERIOD and value.
-    # We'll assume it yields columns 'geo' (region code), 'time_period', and 0 (the value).
-    if 'geo' in df_nights.columns:
-        df_nights = df_nights[['geo', 0]].rename(columns={'geo': 'region_code', 0: 'tourist_nights'})
-    else:
-        # If multi-index, attempt to flatten
-        df_nights.columns = [col if isinstance(col, str) else str(col) for col in df_nights.columns]
-        # Look for region and value columns
-        for col in df_nights.columns:
-            if 'geo' in col.lower():
-                df_nights.rename(columns={col: 'region_code'}, inplace=True)
-        if 'region_code' not in df_nights.columns:
-            df_nights['region_code'] = df_nights.index  # fallback
-        if 'value' in df_nights.columns:
-            df_nights.rename(columns={'value': 'tourist_nights'}, inplace=True)
-    # Fetch regional GDP (current prices) by NUTS2 for the same year
-    gdp_flow = 'nama_10r_2gdp'  # GDP at current market prices by NUTS2
-    resp_gdp = estat.data(gdp_flow, params={'time': str(year)})
-    df_gdp = resp_gdp.to_pandas().reset_index()
-    if 'geo' in df_gdp.columns:
-        df_gdp = df_gdp[['geo', 0]].rename(columns={'geo': 'region_code', 0: 'gdp_meur'})
-    else:
-        df_gdp.columns = [col if isinstance(col, str) else str(col) for col in df_gdp.columns]
-        if 'geo' in df_gdp.columns:
-            df_gdp.rename(columns={'geo': 'region_code'}, inplace=True)
-        if 'value' in df_gdp.columns:
-            df_gdp.rename(columns={'value': 'gdp_meur'}, inplace=True)
-    # Merge the two datasets on region_code
-    df = pd.merge(df_nights, df_gdp, on='region_code', how='inner')
+    """
+    Fetch tourism & economic data from Eurostat REST API (no pandasdmx).
+    - tour_occ_nin2: nights spent at tourist accommodation (NUTS2)
+    - nama_10r_2gdp: regional GDP (Mio EUR, NUTS2)
+    Returns: DataFrame with columns [region_code, tourist_nights, gdp_meur]
+    """
+    import itertools
+
+    def fetch_jsonstat(dataset_code, params):
+        base = "https://ec.europa.eu/eurostat/api/dissemination/statistics/1.0/JSON/en/"
+        url = base + dataset_code
+        r = requests.get(url, params=params, timeout=60)
+        r.raise_for_status()
+        return r.json()
+
+    def jsonstat_to_df(js):
+        # Parse JSON-stat (Eurostat v1.0) into a flat DataFrame of dimension codes + value
+        dim = js["dimension"]
+        dim_ids = js["id"] if "id" in js else list(dim.keys())
+        categories = {d: dim[d]["category"] for d in dim_ids}
+        # ordered codes per dimension
+        code_lists = {
+            d: [c for c, _ in sorted(categories[d]["index"].items(), key=lambda kv: kv[1])]
+            for d in dim_ids
+        }
+        # total size (cartesian product)
+        sizes = [len(code_lists[d]) for d in dim_ids]
+        # values can be dense list or sparse dict
+        values = js["value"]
+        records = []
+
+        if isinstance(values, list):
+            # dense array (length == product of sizes)
+            for flat_idx, v in enumerate(values):
+                if v is None:
+                    continue
+                idxs = []
+                n = flat_idx
+                # decode flat index into multi-index
+                for size in reversed(sizes):
+                    idxs.append(n % size)
+                    n //= size
+                idxs = list(reversed(idxs))
+                rec = {}
+                for d, i in zip(dim_ids, idxs):
+                    rec[d] = code_lists[d][i]
+                rec["value"] = v
+                records.append(rec)
+        else:
+            # sparse dict {flat_idx_str: value}
+            for flat_idx_str, v in values.items():
+                if v is None:
+                    continue
+                flat_idx = int(flat_idx_str)
+                idxs = []
+                n = flat_idx
+                for size in reversed(sizes):
+                    idxs.append(n % size)
+                    n //= size
+                idxs = list(reversed(idxs))
+                rec = {}
+                for d, i in zip(dim_ids, idxs):
+                    rec[d] = code_lists[d][i]
+                rec["value"] = v
+                records.append(rec)
+
+        return pd.DataFrame.from_records(records)
+
+    # --- Nights spent at tourist accommodation (NUTS2) ---
+    # dataset: tour_occ_nin2
+    # filters: unit=NR (number), and time=year
+    nights_js = fetch_jsonstat(
+        "tour_occ_nin2",
+        {"time": str(year), "unit": "NR"}
+    )
+    df_n = jsonstat_to_df(nights_js)
+    # standardize column names
+    if "geo" in df_n.columns:
+        df_n.rename(columns={"geo": "region_code"}, inplace=True)
+    if "time" in df_n.columns:
+        df_n.rename(columns={"time": "year"}, inplace=True)
+    df_n = df_n[["region_code", "year", "value"]]
+    df_n = df_n.rename(columns={"value": "tourist_nights"})
+    # keep only NUTS2 (Eurostat codes are like EL30, DE60 etc.; ensure length >=4 and no “TOTAL”)
+    df_n = df_n[df_n["region_code"].str.len().ge(4)].copy()
+
+    # --- Regional GDP at current market prices (NUTS2) ---
+    # dataset: nama_10r_2gdp (value in million EUR)
+    gdp_js = fetch_jsonstat(
+        "nama_10r_2gdp",
+        {"time": str(year)}
+    )
+    df_g = jsonstat_to_df(gdp_js)
+    if "geo" in df_g.columns:
+        df_g.rename(columns={"geo": "region_code"}, inplace=True)
+    if "time" in df_g.columns:
+        df_g.rename(columns={"time": "year"}, inplace=True)
+    df_g = df_g[["region_code", "year", "value"]]
+    df_g = df_g.rename(columns={"value": "gdp_meur"})
+    df_g = df_g[df_g["region_code"].str.len().ge(4)].copy()
+
+    # Merge on region_code
+    df = pd.merge(
+        df_n[["region_code", "tourist_nights"]],
+        df_g[["region_code", "gdp_meur"]],
+        on="region_code",
+        how="inner"
+    )
+
+    # basic sanity cast
+    df["tourist_nights"] = pd.to_numeric(df["tourist_nights"], errors="coerce")
+    df["gdp_meur"] = pd.to_numeric(df["gdp_meur"], errors="coerce")
+
+    # Drop NAs
+    df = df.dropna(subset=["tourist_nights", "gdp_meur"]).reset_index(drop=True)
     return df
+
 
 @st.cache_data(show_spinner=True)
 def load_worldbank_data(year=2019):
