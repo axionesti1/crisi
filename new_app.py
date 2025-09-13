@@ -1,411 +1,304 @@
+import streamlit as st
 import pandas as pd
 import numpy as np
-import yaml
-import streamlit as st
-from typing import Dict, List, Any
-from sklearn.decomposition import PCA
+import requests
+import json
 
-st.set_page_config(page_title="CRISI: Multi-Scenario, Multi-Horizon Scorer", layout="wide")
+# For data APIs
+import pandasdmx as sdmx      # Eurostat SDMX client
+import wbdata                # World Bank data
+import cdsapi                # Copernicus Climate Data Store API
 
-# Cache data loading for efficiency
-@st.cache_data
-def load_csv(path: str) -> pd.DataFrame:
-    """Load a CSV file, allowing spaces after delimiters."""
-    return pd.read_csv(path, skipinitialspace=True)
+# For ML
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split, RandomizedSearchCV
+from sklearn.metrics import mean_squared_error, r2_score
+# Optionally, include XGBoost (ensure it's installed in requirements)
+# from xgboost import XGBRegressor
 
+# For explainability
+import shap
+import matplotlib.pyplot as plt
 
-@st.cache_data
-def load_cfg(path: str) -> Dict[str, Any]:
-    """Load the YAML configuration file."""
-    with open(path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+# Config streamlit page
+st.set_page_config(page_title="CRISI Tourism-Climate Resilience Dashboard", layout="wide")
 
+st.title("🌍 CRISI – Tourism Climate Resilience Dashboard")
+st.write("This app links climate hazards with tourism economics to assess the resilience of destinations under climate change.")
 
-def min_max(series: pd.Series) -> pd.Series:
-    """Normalize a series to the [0, 1] range using min-max scaling.
+# --- Data Loading and Caching ---
 
-    If all values are equal, returns 0.5 for all entries.
-    """
-    s = series.astype(float)
-    mn, mx = float(s.min()), float(s.max())
-    if mx == mn:
-        return pd.Series(np.full(len(s), 0.5), index=s.index)
-    return (s - mn) / (mx - mn)
+@st.cache_data(show_spinner=True)
+def load_eurostat_data(year=2019):
+    """Fetch tourism and economic data from Eurostat for a given year."""
+    estat = sdmx.Request('ESTAT')
+    # Example: Nights spent at tourist accommodations by NUTS2 region
+    data_flow = 'tour_occ_nin2'  # dataset code for tourist nights (annual)
+    params = {'time': str(year)}  # filter by year
+    # Retrieve all regions by not specifying 'geo' key (could also specify geo=ALL or chunk by country)
+    resp = estat.data(data_flow, params=params)
+    df_nights = resp.to_pandas()  # Convert SDMX to pandas DataFrame
+    # The DataFrame might have multi-index columns (e.g., units, geo). We reset index for clarity.
+    df_nights = df_nights.reset_index()
+    # Typically, Eurostat data will have columns like GEO and TIME_PERIOD and value.
+    # We'll assume it yields columns 'geo' (region code), 'time_period', and 0 (the value).
+    if 'geo' in df_nights.columns:
+        df_nights = df_nights[['geo', 0]].rename(columns={'geo': 'region_code', 0: 'tourist_nights'})
+    else:
+        # If multi-index, attempt to flatten
+        df_nights.columns = [col if isinstance(col, str) else str(col) for col in df_nights.columns]
+        # Look for region and value columns
+        for col in df_nights.columns:
+            if 'geo' in col.lower():
+                df_nights.rename(columns={col: 'region_code'}, inplace=True)
+        if 'region_code' not in df_nights.columns:
+            df_nights['region_code'] = df_nights.index  # fallback
+        if 'value' in df_nights.columns:
+            df_nights.rename(columns={'value': 'tourist_nights'}, inplace=True)
+    # Fetch regional GDP (current prices) by NUTS2 for the same year
+    gdp_flow = 'nama_10r_2gdp'  # GDP at current market prices by NUTS2
+    resp_gdp = estat.data(gdp_flow, params={'time': str(year)})
+    df_gdp = resp_gdp.to_pandas().reset_index()
+    if 'geo' in df_gdp.columns:
+        df_gdp = df_gdp[['geo', 0]].rename(columns={'geo': 'region_code', 0: 'gdp_meur'})
+    else:
+        df_gdp.columns = [col if isinstance(col, str) else str(col) for col in df_gdp.columns]
+        if 'geo' in df_gdp.columns:
+            df_gdp.rename(columns={'geo': 'region_code'}, inplace=True)
+        if 'value' in df_gdp.columns:
+            df_gdp.rename(columns={'value': 'gdp_meur'}, inplace=True)
+    # Merge the two datasets on region_code
+    df = pd.merge(df_nights, df_gdp, on='region_code', how='inner')
+    return df
 
+@st.cache_data(show_spinner=True)
+def load_worldbank_data(year=2019):
+    """Fetch country-level socio-economic indicators from World Bank for given year."""
+    # Define indicators to fetch
+    indicators = {
+        'SP.POP.TOTL': 'population',
+        'NY.GDP.PCAP.CD': 'gdp_per_capita'
+        # (Add more indicators as needed, e.g. tourism % GDP if available)
+    }
+    # Fetch data for all countries for the specified year
+    df_wb = wbdata.get_dataframe(indicators, country='all', data_date=str(year))
+    df_wb = df_wb.reset_index()
+    # The DataFrame typically has columns: country, date, indicator values
+    df_wb = df_wb[df_wb['date'] == year]  # filter the year if needed
+    df_wb = df_wb[['country', 'population', 'gdp_per_capita']]
+    # Country codes in wbdata might be ISO3 or ISO2 country codes. We'll assume ISO2 for mapping.
+    # Create a lookup from country code to indicators
+    country_data = {}
+    for _, row in df_wb.iterrows():
+        country_code = str(row['country']).upper()
+        country_data[country_code] = {
+            'population': row['population'],
+            'gdp_per_capita': row['gdp_per_capita']
+        }
+    return country_data
 
-def normalize_df(df: pd.DataFrame, benefit: Dict[str, bool], indicators: List[str]) -> pd.DataFrame:
-    """Add normalized indicator columns to a DataFrame.
+@st.cache_data(show_spinner=True)
+def load_climate_data():
+    """Fetch or simulate climate hazard indicators (baseline + scenario deltas)."""
+    # In a real app, we might retrieve data via cdsapi. Here, we'll simulate a climate metric.
+    # For example, baseline average summer temperature by region (simulated) and an increase under scenarios.
+    # We'll create a dummy dictionary of region_code -> baseline_temp.
+    baseline_temp = {}
+    for region in data['region_code'].unique():
+        # simulate baseline temp by latitude: just random or based on region code
+        baseline_temp[region] = 25 + (hash(region) % 10) * 0.1  # random-ish base temp
+    return baseline_temp
 
-    Each indicator gets a corresponding column prefixed with ``norm__``.
-    Indicators for which ``benefit`` is False are inverted so that lower raw values become higher normalized values.
-    """
-    out = df.copy()
-    for ind in indicators:
-        norm = min_max(out[ind])
-        if not benefit.get(ind, True):
-            norm = 1 - norm
-        out[f"norm__{ind}"] = norm
-    return out
-
-
-def weight_vector(base_weights: Dict[str, float], override: Dict[str, float]) -> Dict[str, float]:
-    """Combine base weights with optional overrides and normalize them to sum to 1."""
-    w = base_weights.copy()
-    if override:
-        w.update(override)
-    s = sum(w.values())
-    if s != 0:
-        for k in w:
-            w[k] = w[k] / s
-    return w
-
-
-def apply_rcp(
-    df: pd.DataFrame,
-    scenario_cfg: Dict[str, Any],
-    years: int,
-    ui_mult: float = None,
-) -> pd.DataFrame:
-    """Project climate risk forward for RCP scenarios.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The base DataFrame.
-    scenario_cfg : Dict[str, Any]
-        Scenario configuration from the YAML.
-    years : int
-        Number of years forward to project.
-    ui_mult : float, optional
-        UI override multiplier per 10 years. If provided, overrides the YAML multiplier.
-    """
-    out = df.copy()
-    mult_10y = float(scenario_cfg.get("climate_multiplier_per_10y", 1.0))
-    if ui_mult is not None:
-        mult_10y = ui_mult
-    factor = mult_10y ** (years / 10)
-    if "climate_risk" in out.columns:
-        out["climate_risk"] = out["climate_risk"] * factor
-    return out
-
-
-def apply_foresight(
-    df: pd.DataFrame,
-    reg: str,
-    tech: str,
-    years: int,
-    REG: Dict[str, Dict[str, float]] = None,
-    TECH: Dict[str, Dict[str, float]] = None,
-) -> pd.DataFrame:
-    """Project multiple indicators forward for foresight scenarios.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The base DataFrame.
-    reg : str
-        Regulation type ('strict' or 'easy').
-    tech : str
-        Technology type ('strict' or 'easy').
-    years : int
-        Number of years forward to project.
-    REG : Dict[str, Dict[str, float]], optional
-        Per-10-year multipliers for regulation effects.
-    TECH : Dict[str, Dict[str, float]], optional
-        Per-10-year multipliers for technology effects.
-    """
-    out = df.copy()
-    steps = years / 10
-
-    def apply_mult(col: str, mult_10y: float) -> None:
-        if col in out.columns:
-            out[col] = out[col] * (mult_10y ** steps)
-
-    # Apply regulation multipliers
-    for col, m in REG.get(reg, {}).items():
-        apply_mult(col, m)
-    # Apply technology multipliers
-    for col, m in TECH.get(tech, {}).items():
-        apply_mult(col, m)
-    return out
-
-
-def score_once(df: pd.DataFrame, weights: Dict[str, float], indicators: List[str]) -> (pd.DataFrame, pd.Series):
-    """Compute the composite score for each row and return contributions.
-
-    Returns a DataFrame with a new 'score' column and the sum of contributions across indicators.
-    """
-    out = df.copy()
-    s = np.zeros(len(df))
-    contrib_cols = []
-    for ind in indicators:
-        cc = f"contrib__{ind}"
-        out[cc] = out[f"norm__{ind}"] * weights[ind]
-        s += out[cc].values
-        contrib_cols.append(cc)
-    out["score"] = s
-    return out, out[contrib_cols].sum(axis=0)
-
-
-def run_scenario(
-    df_base: pd.DataFrame,
-    cfg: Dict[str, Any],
-    scenario_name: str,
-    horizons: List[int],
-    use_pca_weights: bool,
-    rcp45_mult: float,
-    rcp85_mult: float,
-    reg_strict_cr: float,
-    reg_strict_inc: float,
-    reg_strict_un: float,
-    reg_easy_cr: float,
-    reg_easy_inc: float,
-    reg_easy_un: float,
-    tech_strict_infra: float,
-    tech_strict_seas: float,
-    tech_strict_un: float,
-    tech_easy_infra: float,
-    tech_easy_seas: float,
-    tech_easy_un: float,
-) -> pd.DataFrame:
-    """Run a scenario across multiple horizons and return a tidy DataFrame."""
-    scen = cfg["scenarios"][scenario_name]
-    indicators = list(cfg["weights"].keys())
-    benefit = cfg["benefit"]
-    base_w = cfg["weights"]
-    weights_override = scen.get("weights_override", {})
-    w = weight_vector(base_w, weights_override)
-    # Optionally compute PCA-based weights once per run
-    if use_pca_weights:
-        norm_base = normalize_df(df_base, benefit, indicators)
-        X = norm_base[[f"norm__{i}" for i in indicators]].fillna(0.5)
-        pca = PCA(n_components=1).fit(X)
-        load = np.abs(pca.components_[0])
-        load = load / load.sum()
-        w = {ind: float(load[i]) for i, ind in enumerate(indicators)}
-    rows = []
-    for years in horizons:
-        if scen["type"] == "baseline":
-            df_proj = df_base.copy()
-        elif scen["type"] == "rcp":
-            ui = None
-            if scenario_name == "rcp45":
-                ui = rcp45_mult
-            elif scenario_name == "rcp85":
-                ui = rcp85_mult
-            df_proj = apply_rcp(df_base, scen, years, ui_mult=ui)
-        elif scen["type"] == "foresight":
-            REG = {
-                "strict": {"climate_risk": reg_strict_cr, "income_dependency": reg_strict_inc, "unemployment_rate": reg_strict_un},
-                "easy":   {"climate_risk": reg_easy_cr,   "income_dependency": reg_easy_inc,   "unemployment_rate": reg_easy_un},
-            }
-            TECH = {
-                "strict": {"infra_score": tech_strict_infra, "seasonality_index": tech_strict_seas, "unemployment_rate": tech_strict_un},
-                "easy":   {"infra_score": tech_easy_infra,   "seasonality_index": tech_easy_seas,   "unemployment_rate": tech_easy_un},
-            }
-            df_proj = apply_foresight(df_base, scen["regulation"], scen["technology"], years, REG=REG, TECH=TECH)
-        else:
-            df_proj = df_base.copy()
-        df_norm = normalize_df(df_proj, benefit, indicators)
-        scored, _ = score_once(df_norm, w, indicators)
-        keep = ["region", "nuts3_code", "lat", "lon", "score"] + [f"norm__{i}" for i in indicators] + [f"contrib__{i}" for i in indicators]
-        scored = scored[keep]
-        scored["scenario"] = scenario_name
-        scored["horizon_years"] = years
-        rows.append(scored)
-    return pd.concat(rows, ignore_index=True)
-
-
-def main() -> None:
-    """Entry point for the Streamlit app."""
-    st.title("CRISI: Multi-Scenario, Multi-Horizon Scorer")
-    # Sidebar inputs
-    with st.sidebar:
-        st.header("Inputs")
-        data_path = st.text_input("Data CSV path", value="data/regions_demo.csv")
-        cfg = load_cfg("indicators.yaml")
-        horizons_all = cfg.get("horizons", [5, 10, 15, 20, 25, 30])
-        scenarios = list(cfg["scenarios"].keys())
-        scen_sel = st.multiselect("Scenarios", options=scenarios, default=scenarios)
-        horizons_sel = st.multiselect("Horizons (years)", options=horizons_all, default=horizons_all)
-        topn = st.number_input("Top N regions (charts)", min_value=1, max_value=50, value=10, step=1)
-        use_pca_weights = st.checkbox("Use PCA-derived weights (auto-learned)", value=False)
-        # Dynamic knobs for scenario projections
-        with st.expander("Adjust scenario dynamics (advanced)", expanded=False):
-            st.caption("Per-10-year multipliers. <1 improves 'bad' indicators; >1 worsens.")
-            st.markdown("**RCP climate multipliers (per 10y)**")
-            rcp45_mult = st.slider("RCP45 climate risk × per 10y", 0.80, 1.10, 0.95, 0.01)
-            rcp85_mult = st.slider("RCP85 climate risk × per 10y", 1.00, 1.50, 1.15, 0.01)
-            st.markdown("**Regulation effects (per 10y)**")
-            reg_strict_cr = st.slider("Strict: climate_risk ×", 0.80, 1.10, 0.92, 0.01)
-            reg_strict_inc = st.slider("Strict: income_dependency ×", 0.80, 1.10, 0.94, 0.01)
-            reg_strict_un = st.slider("Strict: unemployment_rate ×", 0.80, 1.10, 0.98, 0.01)
-            reg_easy_cr = st.slider("Easy: climate_risk ×", 0.90, 1.20, 1.05, 0.01)
-            reg_easy_inc = st.slider("Easy: income_dependency ×", 0.90, 1.10, 0.99, 0.01)
-            reg_easy_un = st.slider("Easy: unemployment_rate ×", 0.80, 1.10, 0.96, 0.01)
-            st.markdown("**Technology effects (per 10y)**")
-            tech_strict_infra = st.slider("Strict tech: infra_score ×", 0.90, 1.30, 1.12, 0.01)
-            tech_strict_seas = st.slider("Strict tech: seasonality ×", 0.80, 1.10, 0.94, 0.01)
-            tech_strict_un = st.slider("Strict tech: unemployment ×", 0.80, 1.10, 0.92, 0.01)
-            tech_easy_infra = st.slider("Easy tech: infra_score ×", 0.90, 1.20, 1.05, 0.01)
-            tech_easy_seas = st.slider("Easy tech: seasonality ×", 0.90, 1.10, 0.98, 0.01)
-            tech_easy_un = st.slider("Easy tech: unemployment ×", 0.80, 1.10, 0.96, 0.01)
-    # Load data
-    df = load_csv(data_path)
-    if df is None or df.empty:
-        st.warning("No data loaded. Check the file path.")
-        return
-    # Run selected scenarios and horizons
-    all_scored = []
-    for sn in scen_sel:
-        all_scored.append(
-            run_scenario(
-                df,
-                cfg,
-                sn,
-                horizons_sel,
-                use_pca_weights,
-                rcp45_mult,
-                rcp85_mult,
-                reg_strict_cr,
-                reg_strict_inc,
-                reg_strict_un,
-                reg_easy_cr,
-                reg_easy_inc,
-                reg_easy_un,
-                tech_strict_infra,
-                tech_strict_seas,
-                tech_strict_un,
-                tech_easy_infra,
-                tech_easy_seas,
-                tech_easy_un,
-            )
-        )
-    if not all_scored:
+# --- Load and combine data ---
+with st.spinner("Loading data from Eurostat and World Bank..."):
+    try:
+        data = load_eurostat_data(year=2019)
+    except Exception as e:
+        st.error(f"Error fetching Eurostat data: {e}")
         st.stop()
-    scored_long = pd.concat(all_scored, ignore_index=True)
-    # Charts
-    st.subheader("Scores over Time (line chart)")
-    # Determine top regions from latest horizon of first selected scenario
-    if scen_sel:
-        ref = scored_long[scored_long["scenario"] == scen_sel[0]]
-    else:
-        ref = pd.DataFrame()
-    if not ref.empty:
-        latest = max(horizons_sel)
-        top_regions = (
-            ref[ref["horizon_years"] == latest]
-            .nlargest(topn, "score")
-            ["region"]
-            .unique()
-            .tolist()
-        )
-    else:
-        latest = max(horizons_sel)
-        top_regions = scored_long["region"].unique().tolist()
-    line_df = scored_long[scored_long["region"].isin(top_regions)].copy()
-    line_piv = line_df.pivot_table(
-        index="horizon_years", columns=["region", "scenario"], values="score"
-    )
-    # Flatten the MultiIndex columns for Streamlit
-    if isinstance(line_piv.columns, pd.MultiIndex):
-        line_piv.columns = [f"{r} ({s})" for r, s in line_piv.columns.to_list()]
-    st.line_chart(line_piv)
-    # Bar chart: top N per scenario at latest horizon
-    st.subheader("Top Regions (bar, latest horizon per scenario)")
-    bar_scope = scored_long[scored_long["horizon_years"] == latest]
-    bar_df = (
-        bar_scope.sort_values(["scenario", "score"], ascending=[True, False])
-        .groupby("scenario")
-        .head(topn)
-    )
-    bar_piv = bar_df.pivot_table(index="region", columns="scenario", values="score").fillna(0)
-    st.bar_chart(bar_piv)
-    # Contributions area chart
-    st.subheader("Indicator Contributions (stacked for one region)")
-    indicators = list(cfg["weights"].keys())
-    region_pick = st.selectbox(
-        "Region", sorted(scored_long["region"].unique().tolist())
-    )
-    scen_for_contrib = st.selectbox(
-        "Scenario (for contributions)", sorted(scored_long["scenario"].unique().tolist())
-    )
-    contrib_df = (
-        scored_long[
-            (scored_long["region"] == region_pick)
-            & (scored_long["scenario"] == scen_for_contrib)
-        ][["horizon_years"] + [f"contrib__{i}" for i in indicators]]
-        .sort_values("horizon_years")
-        .set_index("horizon_years")
-    )
-    contrib_df.columns = [c.replace("contrib__", "") for c in contrib_df.columns]
-    st.area_chart(contrib_df)
-    # Simple point map (fallback). A choropleth will be used if a GeoJSON is provided and GeoPandas is available.
-    st.subheader("Map (points)")
-    latest_scope = scored_long[
-        (scored_long["scenario"] == scen_sel[0])
-        & (scored_long["horizon_years"] == latest)
-    ]
-    if {"lat", "lon"}.issubset(latest_scope.columns):
-        st.map(latest_scope.rename(columns={"lat": "latitude", "lon": "longitude"}))
-    # Download sections
-    st.subheader("Download results")
-    long_cols = [
-        "region",
-        "nuts3_code",
-        "scenario",
-        "horizon_years",
-        "score",
-    ] + [c for c in scored_long.columns if c.startswith("norm__")] + [c for c in scored_long.columns if c.startswith("contrib__")]
-    dl_long = scored_long[long_cols].sort_values(
-        ["scenario", "horizon_years", "score"], ascending=[True, True, False]
-    )
-    st.download_button(
-        "Download scores (tidy long CSV)",
-        data=dl_long.to_csv(index=False).encode("utf-8"),
-        file_name="scores_long.csv",
-        mime="text/csv",
-    )
-    summary = (
-        scored_long[scored_long["horizon_years"] == latest]
-        .sort_values(["scenario", "score"], ascending=[True, False])
-        .groupby("scenario")
-        .head(topn)[["scenario", "region", "nuts3_code", "score"]]
-    )
-    st.download_button(
-        "Download summary (latest horizon, top N per scenario)",
-        data=summary.to_csv(index=False).encode("utf-8"),
-        file_name="summary_latest_topN.csv",
-        mime="text/csv",
-    )
-    # Additional ranking with buckets for the latest horizon
-    latest_scope = scored_long[scored_long["horizon_years"] == latest].copy()
-    latest_scope["rank_within_scenario"] = latest_scope.groupby("scenario")["score"].rank(
-        ascending=False, method="min"
-    )
-    latest_scope["bucket_1_low_5_high"] = (
-        (latest_scope["score"] * 5).clip(0, 4).astype(int) + 1
-    )
-    st.download_button(
-        "Download ranked (latest horizon, all regions + buckets)",
-        data=(
-            latest_scope.sort_values(
-                ["scenario", "rank_within_scenario"]
-            )[
-                [
-                    "scenario",
-                    "region",
-                    "nuts3_code",
-                    "score",
-                    "rank_within_scenario",
-                    "bucket_1_low_5_high",
-                ]
-            ].to_csv(index=False).encode("utf-8")
-        ),
-        file_name="ranked_latest.csv",
-        mime="text/csv",
-    )
+    country_stats = load_worldbank_data(year=2019)
 
+# Merge country-level data into regional dataframe
+# Assume region_code first 2 letters correspond to country (NUTS2).
+def map_country_code(nuts_code):
+    cc = nuts_code[:2].upper()
+    # Map exceptions: NUTS uses 'EL' for Greece, 'UK' for United Kingdom, etc.
+    cc_map = {'EL': 'GR', 'UK': 'GB'}  # ISO2: Greece->GR, UK->GB
+    return cc_map.get(cc, cc)
 
-if __name__ == "__main__":
-    main()
+data['country_code'] = data['region_code'].apply(map_country_code)
+# Add WB indicators to each region row
+data['population'] = data['country_code'].apply(lambda cc: country_stats.get(cc, {}).get('population', np.nan))
+data['gdp_per_capita'] = data['country_code'].apply(lambda cc: country_stats.get(cc, {}).get('gdp_per_capita', np.nan))
+
+# Compute additional features
+data['tourism_intensity'] = data['tourist_nights'] / data['population']  # nights per person, as a tourism dependence metric
+# Handle any infinities or missing:
+data.replace([np.inf, -np.inf], np.nan, inplace=True)
+
+# Drop rows with missing key data if any (simplify)
+data.dropna(subset=['tourist_nights', 'gdp_meur', 'population'], inplace=True)
+
+# --- Define target (Resilience Score) ---
+# Here we create a simple resilience score for demonstration.
+# We'll say higher tourism intensity and higher temperature increase => higher risk => lower resilience.
+# Higher GDP per cap => more adaptive capacity => higher resilience.
+# This is an illustrative formula.
+data['resilience_score'] = 0.0
+# Normalize indicators for combination
+# (In practice, use proper normalization as per config weights:contentReference[oaicite:19]{index=19}:contentReference[oaicite:20]{index=20})
+tn_max = data['tourism_intensity'].max()
+gdp_max = data['gdp_per_capita'].max()
+data['norm_tourism_intensity'] = data['tourism_intensity'] / tn_max
+data['norm_gdp_per_capita'] = data['gdp_per_capita'] / gdp_max
+# Assign a dummy climate risk indicator (this will be updated per scenario)
+data['climate_risk'] = 0.0  # placeholder, e.g. projected temp increase (will set later)
+
+# Initial climate data (baseline)
+baseline_temp = load_climate_data()
+# We use baseline_temp to fill climate_risk initially as baseline temperature (normalized)
+temps = []
+for region in data['region_code']:
+    temps.append(baseline_temp.get(region, 0.0))
+data['baseline_temp'] = temps
+# Normalize baseline_temp for use
+if len(data) > 0:
+    data['norm_baseline_temp'] = (data['baseline_temp'] - data['baseline_temp'].min()) / (data['baseline_temp'].max() - data['baseline_temp'].min())
+else:
+    data['norm_baseline_temp'] = 0.0
+# Set initial climate risk indicator as normalized baseline temp (as a proxy: higher temp => more climate risk for tourism maybe)
+data['climate_risk'] = data['norm_baseline_temp']
+
+# Now define resilience_score (simple formula: higher GDP => higher resilience, higher tourism intensity or climate risk => lower resilience)
+data['resilience_score'] = (data['norm_gdp_per_capita'] * 0.4) - (data['norm_tourism_intensity'] * 0.3) - (data['climate_risk'] * 0.3)
+# Scale to 0-100
+min_res, max_res = data['resilience_score'].min(), data['resilience_score'].max()
+data['resilience_score'] = 100 * (data['resilience_score'] - min_res) / (max_res - min_res + 1e-9)
+
+# --- Sidebar for scenario selection ---
+st.sidebar.header("Scenario Selection")
+scenario = st.sidebar.selectbox("Climate Scenario", ["RCP4.5", "RCP8.5"])
+year = st.sidebar.selectbox("Year", [2030, 2050])
+
+st.sidebar.write("Selected scenario:", scenario, year)
+
+# Adjust climate risk based on scenario (simple multiplier for demo)
+# In a real case, we'd retrieve actual projections for the selected year & scenario.
+if scenario == "RCP4.5":
+    # Moderate increase by selected year
+    # e.g. +1°C by 2050 (relative to baseline), scaled by year
+    temp_increase = 1.0 * ((year - 2019) / (2050 - 2019))  # proportion of 1°C
+elif scenario == "RCP8.5":
+    # Larger increase, e.g. +3°C by 2050
+    temp_increase = 3.0 * ((year - 2019) / (2050 - 2019))
+else:
+    temp_increase = 0.0
+
+# Update climate_risk feature: assume climate_risk = normalized (baseline_temp + temp_increase)
+data['proj_temp'] = data['baseline_temp'] + temp_increase
+# Normalize projected temperature similarly
+data['climate_risk'] = (data['proj_temp'] - data['proj_temp'].min()) / (data['proj_temp'].max() - data['proj_temp'].min() + 1e-9)
+
+# Recalculate resilience_score for the scenario (keeping same formula structure)
+data['resilience_score'] = (data['norm_gdp_per_capita'] * 0.4) - (data['norm_tourism_intensity'] * 0.3) - (data['climate_risk'] * 0.3)
+# Rescale to 0-100
+min_res, max_res = data['resilience_score'].min(), data['resilience_score'].max()
+data['resilience_score'] = 100 * (data['resilience_score'] - min_res) / (max_res - min_res + 1e-9)
+
+# --- Machine Learning: Train model on current data (baseline) to predict resilience_score ---
+# Features for model (we exclude region identifiers and direct target)
+feature_cols = ['tourism_intensity', 'gdp_per_capita', 'climate_risk']
+X = data[feature_cols].fillna(0.0)
+y = data['resilience_score']
+
+# Split data for training (though we might use all data if it's small)
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Model training with hyperparameter tuning (Random Forest)
+rf = RandomForestRegressor(random_state=42)
+param_dist = {
+    'n_estimators': [100, 200],
+    'max_depth': [3, 5, None],
+    'min_samples_split': [2, 5],
+}
+cv = RandomizedSearchCV(rf, param_distributions=param_dist, n_iter=5, cv=3, scoring='neg_mean_squared_error', random_state=42)
+cv.fit(X_train, y_train)
+best_model = cv.best_estimator_
+
+# Evaluate model
+y_pred = best_model.predict(X_test)
+mse = mean_squared_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+
+st.subheader("Model Performance")
+st.write(f"Test MSE: {mse:.2f}, R²: {r2:.2f}")
+# (In a real scenario with more data, we’d also display cross-val scores, etc.)
+
+# Feature importances from model
+importances = None
+if hasattr(best_model, "feature_importances_"):
+    importances = best_model.feature_importances_
+    importance_df = pd.DataFrame({'feature': feature_cols, 'importance': importances})
+    importance_df.sort_values('importance', ascending=False, inplace=True)
+    st.write("Feature importances (model):")
+    st.dataframe(importance_df.reset_index(drop=True))
+
+# SHAP explainability on a sample of training data
+st.subheader("Feature Importance and Explainability")
+# Using SHAP to explain the model predictions
+explainer = shap.Explainer(best_model, X_train)
+shap_values = explainer(X_train)
+
+# Bar chart of mean absolute SHAP values for each feature
+shap_avg = np.mean(np.abs(shap_values.values), axis=0)
+shap_importance_df = pd.DataFrame({'feature': feature_cols, 'mean_abs_shap': shap_avg})
+shap_importance_df.sort_values('mean_abs_shap', ascending=False, inplace=True)
+st.write("Mean absolute SHAP value (feature importance):")
+st.dataframe(shap_importance_df.reset_index(drop=True))
+
+# We can also plot SHAP summary plot (as a static image)
+fig, ax = plt.subplots()
+shap.summary_plot(shap_values.values, X_train, feature_names=feature_cols, plot_type="bar", show=False)
+plt.tight_layout()
+st.pyplot(fig)
+
+# --- Map Visualization ---
+st.subheader("Resilience Scores by Region")
+# Load geojson for NUTS2 regions (from GISCO)
+geo_url = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_BN_03M_2024_4326_LEVL_2.geojson"
+try:
+    geojson_data = requests.get(geo_url).json()
+except Exception as e:
+    st.error("Could not load region boundaries GeoJSON.")
+    geojson_data = None
+
+if geojson_data:
+    import plotly.express as px
+    # Prepare data for mapping
+    map_df = data[['region_code', 'resilience_score']].copy()
+    map_df['resilience_score'] = map_df['resilience_score'].round(1)
+    fig_map = px.choropleth(
+        map_df, geojson=geojson_data, locations='region_code', featureidkey="properties.NUTS_ID",
+        color='resilience_score', color_continuous_scale="YlGnBu", range_color=(0,100),
+        labels={'resilience_score': 'Resilience Score'}, title=f"Resilience Score ({scenario} {year})"
+    )
+    fig_map.update_geos(fitbounds="locations", visible=False)
+    fig_map.update_layout(margin={"r":0,"t":30,"l":0,"b":0})
+    st.plotly_chart(fig_map, use_container_width=True)
+
+    # Add an explanation or caption for the map
+    st.caption("Choropleth map of tourism-climate resilience scores for each NUTS2 region. Use the sidebar to change scenario assumptions.")
+
+# --- Data Download ---
+st.subheader("Download Results")
+csv_data = data[['region_code','resilience_score', 'tourist_nights','population','gdp_meur','gdp_per_capita']].copy()
+csv_data['scenario'] = f"{scenario}_{year}"
+csv = csv_data.to_csv(index=False)
+st.download_button("Download CSV of results", data=csv, file_name=f"resilience_scores_{scenario}_{year}.csv", mime="text/csv")
+
+# Optionally, allow downloading the map as an image (using plotly static image if kaleido is installed)
+try:
+    img_bytes = fig_map.to_image(format="png")
+    st.download_button("Download map as PNG", data=img_bytes, file_name=f"resilience_map_{scenario}_{year}.png", mime="image/png")
+except Exception as e:
+    st.write("Use the plotly toolbar to save the map as an image.")
