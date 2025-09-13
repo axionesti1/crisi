@@ -5,6 +5,8 @@ import requests
 import json
 import yaml
 from pathlib import Path
+from typing import Dict
+import sys
 
 # API and ML libraries
 import cdsapi
@@ -17,11 +19,63 @@ import shap
 import matplotlib.pyplot as plt
 import plotly.express as px
 
+# Add src/ to path for scoring module
+sys.path.append("src")
+from scoring import compute_scores
+
 # Load indicator configuration (Delphi weights and scenarios)
-config = yaml.safe_load(open("indicators.yaml", "r"))
+config = yaml.safe_load(open("config/indicators.yaml", "r"))
 scenario_configs = config.get("scenarios", {})
-weights_config = config.get("weights", {})
-benefit_config = config.get("benefit", {})
+
+# Default per-10-year multipliers for foresight scenarios
+REG = {
+    "strict": {
+        "climate_risk": 0.92,
+        "income_dependency": 0.94,
+        "unemployment_rate": 0.98,
+    },
+    "easy": {
+        "climate_risk": 1.05,
+        "income_dependency": 0.99,
+        "unemployment_rate": 0.96,
+    },
+}
+
+TECH = {
+    "strict": {
+        "infra_score": 1.12,
+        "seasonality_index": 0.94,
+        "unemployment_rate": 0.92,
+    },
+    "easy": {
+        "infra_score": 1.05,
+        "seasonality_index": 0.98,
+        "unemployment_rate": 0.96,
+    },
+}
+
+
+def apply_foresight(
+    df: pd.DataFrame,
+    reg: str,
+    tech: str,
+    years: int,
+    REG: Dict[str, Dict[str, float]] = None,
+    TECH: Dict[str, Dict[str, float]] = None,
+) -> pd.DataFrame:
+    """Project multiple indicators forward for foresight scenarios."""
+    out = df.copy()
+    steps = years / 10
+
+    def apply_mult(col: str, mult_10y: float) -> None:
+        if col in out.columns:
+            out[col] = out[col] * (mult_10y ** steps)
+
+    for col, m in (REG or {}).get(reg, {}).items():
+        apply_mult(col, m)
+    for col, m in (TECH or {}).get(tech, {}).items():
+        apply_mult(col, m)
+    return out
 
 # Streamlit page config
 st.set_page_config(page_title="CRISI Tourism Resilience Dashboard", layout="wide")
@@ -36,15 +90,23 @@ with st.sidebar:
     scenario_key_map = {}
     for key, sc in scenario_configs.items():
         stype = sc.get("type", "").lower()
-        # Include baseline and RCP scenarios; skip complex foresight for simplicity
-        if stype in ("baseline", "rcp"):
-            name = key.upper() if stype == "rcp" else key.capitalize()
-            if key == "rcp45":
-                name = "RCP 4.5"
-            elif key == "rcp85":
-                name = "RCP 8.5"
-            elif key == "baseline":
+              if stype in ("baseline", "rcp", "foresight"):
+            if stype == "rcp":
+                name = key.upper()
+                if key == "rcp45":
+                    name = "RCP 4.5"
+                elif key == "rcp85":
+                    name = "RCP 8.5"
+            elif stype == "baseline":
                 name = "Baseline"
+            else:
+                name = key.replace("_", " ").title()
+            scenario_names.append(name)
+            scenario_key_map[name] = key
+            elif stype == "foresight":
+            reg = sc.get("regulation", "").capitalize()
+            tech = sc.get("technology", "").capitalize()
+            name = f"{reg} / {tech}"
             scenario_names.append(name)
             scenario_key_map[name] = key
     if not scenario_names:
@@ -234,37 +296,48 @@ if not data.empty:
 else:
     data['norm_baseline_temp'] = 0.0
 
-# Compute climate risk based on scenario
-if scenario_key == "baseline":
-    data['climate_risk'] = data['norm_baseline_temp']
-else:
-    scen_cfg = scenario_configs.get(scenario_key, {})
+# Compute climate risk and other indicator projections based on scenario
+scen_cfg = scenario_configs.get(scenario_key, {})
+stype = scen_cfg.get("type", "").lower()
+years_forward = year - 2019
+data['climate_risk'] = data['norm_baseline_temp']
+if stype == "rcp":
     mult10 = float(scen_cfg.get("climate_multiplier_per_10y", 1.0))
-    years_forward = year - 2019
     factor = mult10 ** (years_forward / 10.0)
-    data['climate_risk'] = data['norm_baseline_temp'] * factor
-    data['climate_risk'] = data['climate_risk'].clip(0.0, 1.0)
+     data['climate_risk'] = data['climate_risk'] * factor
+elif stype == "foresight":
+    data = apply_foresight(
+        data,
+        scen_cfg.get("regulation", "easy"),
+        scen_cfg.get("technology", "easy"),
+        years_forward,
+        REG=REG,
+        TECH=TECH,
+    )
+data['climate_risk'] = data['climate_risk'].clip(0.0, 1.0)
 
-# Compute Delphi-weighted resilience score (composite index)
-# Normalize indicators
-def min_max_norm(series):
-    s = series.astype(float)
-    return (s - s.min()) / (s.max() - s.min() + 1e-9)
-if "arrivals_per_capita" in data.columns:
-    data['norm_arrivals'] = min_max_norm(data['arrivals_per_capita'])
-else:
-    data['norm_arrivals'] = 0.0
-data['norm_climate'] = min_max_norm(data['climate_risk'])
-# Combine according to weights and benefit flags (invert climate as lower is better)
-w_arr = weights_config.get("arrivals_per_capita", 0.0)
-w_clim = weights_config.get("climate_risk", 0.0)
-# Apply any overrides (though none set in config)
-override = scenario_configs.get(scenario_key, {}).get("weights_override", {})
-if override:
-    w_arr = override.get("arrivals_per_capita", w_arr)
-    w_clim = override.get("climate_risk", w_clim)
-total_w = w_arr + w_clim if (w_arr + w_clim) != 0 else 1.0
-data['resilience_score'] = 100 * ((data['norm_arrivals'] * w_arr + (1 - data['norm_climate']) * w_clim) / (total_w))
+# Derive indicators required for compute_scores
+data['region_id'] = data['region_code']
+data['region_name'] = data.get('region_name', data['region_code'])
+data['scenario'] = scenario_key
+data['tourism_gdp_share'] = (data['tourist_nights'] / (data['gdp_meur'] * 1e6)).fillna(0.0)
+data['seasonality_idx'] = 0.5
+data['readiness_proxy'] = (data['gdp_per_capita'] / data['gdp_per_capita'].max()).fillna(0.0)
+data['projected_drop'] = 0.1
+data['heat_tmax_delta'] = data['climate_risk'] * 5.0
+data['heatwave_days'] = data['climate_risk'] * 30.0
+data['drought_spei'] = -data['climate_risk']
+
+# Compute resilience scores using the scoring module
+score_cols = [
+    'region_id', 'region_name', 'scenario',
+    'heat_tmax_delta', 'heatwave_days', 'drought_spei',
+    'tourism_gdp_share', 'seasonality_idx', 'projected_drop',
+    'readiness_proxy'
+]
+scores = compute_scores(data[score_cols].copy())
+data = data.merge(scores[['region_id', 'resilience_score']], on='region_id', how='left')
+data.drop(columns=['region_id'], inplace=True)
 
 # --- Machine Learning Model ---
 st.subheader("Resilience Score Prediction Model")
