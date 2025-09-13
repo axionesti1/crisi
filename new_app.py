@@ -359,22 +359,28 @@ if hasattr(best_model, "feature_importances_"):
 
 # SHAP explainability on a sample of training data
 st.subheader("Feature Importance and Explainability")
-# Using SHAP to explain the model predictions
-explainer = shap.Explainer(best_model, X_train)
-shap_values = explainer(X_train)
+
+# (Optional) subsample for speed
+X_bg = X_train.sample(n=min(1000, len(X_train)), random_state=42)
+
+# Use TreeExplainer for tree models and disable additivity check to avoid spurious errors
+explainer = shap.TreeExplainer(best_model)
+shap_values = explainer.shap_values(X_bg, check_additivity=False)  # ndarray shape: (n_samples, n_features)
 
 # Bar chart of mean absolute SHAP values for each feature
-shap_avg = np.mean(np.abs(shap_values.values), axis=0)
-shap_importance_df = pd.DataFrame({'feature': feature_cols, 'mean_abs_shap': shap_avg})
-shap_importance_df.sort_values('mean_abs_shap', ascending=False, inplace=True)
+shap_avg = np.mean(np.abs(shap_values), axis=0)
+shap_importance_df = pd.DataFrame({'feature': feature_cols, 'mean_abs_shap': shap_avg}).sort_values(
+    'mean_abs_shap', ascending=False
+)
 st.write("Mean absolute SHAP value (feature importance):")
 st.dataframe(shap_importance_df.reset_index(drop=True))
 
-# We can also plot SHAP summary plot (as a static image)
+# SHAP summary bar plot
 fig, ax = plt.subplots()
-shap.summary_plot(shap_values.values, X_train, feature_names=feature_cols, plot_type="bar", show=False)
+shap.summary_plot(shap_values, X_bg, feature_names=feature_cols, plot_type="bar", show=False)
 plt.tight_layout()
 st.pyplot(fig)
+
 
 # --- Map Visualization ---
 st.subheader("Resilience Scores by Region")
