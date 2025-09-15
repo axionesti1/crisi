@@ -122,22 +122,81 @@ def get_eurostat_tiny():
 
 @st.cache_resource
 def get_nuts2_gdf():
-    """Auto-download GISCO NUTS2 (20M, 2021) as GeoDataFrame (no manual unzip)."""
+   import os, zipfile, tempfile, requests, glob
+import geopandas as gpd
+import streamlit as st
+
+@st.cache_resource
+def get_nuts2_gdf():
+    """
+    Download GISCO NUTS 2021 (20M, EPSG:4326) if missing, extract locally,
+    and return a GeoDataFrame filtered to NUTS level 2. Falls back to GeoJSON if needed.
+    """
+    base_dir = os.path.join(os.getcwd(), "data")
+    os.makedirs(base_dir, exist_ok=True)
+
+    zip_url = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/shp/NUTS_RG_20M_2021_4326.zip"
+    zip_path = os.path.join(base_dir, "NUTS_RG_20M_2021_4326.zip")
+    extract_dir = os.path.join(base_dir, "NUTS_RG_20M_2021_4326")
+
+    # 1) Download if not present
+    if not os.path.exists(zip_path):
+        try:
+            st.info("Downloading NUTS2 shapefile (GISCO, ~8–15MB)…")
+            with requests.get(zip_url, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                with open(zip_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=1 << 20):
+                        if chunk:
+                            f.write(chunk)
+        except Exception as e:
+            st.warning(f"Shapefile zip download failed: {e}")
+
+    # 2) Extract if not yet extracted
+    shp_path = None
     try:
-        url = "zip+https://gisco-services.ec.europa.eu/distribution/v2/nuts/shp/NUTS_RG_20M_2021_4326.zip"
-        gdf = gpd.read_file(url)  # GeoPandas can read from zip+http
-        gdf = gdf[gdf["LEVL_CODE"] == 2].to_crs(4326)
-        # Standardize columns
-        if "NUTS_ID" in gdf.columns:
-            gdf = gdf.rename(columns={"NUTS_ID": "id"})
-        if "NAME_LATN" in gdf.columns:
-            gdf = gdf.rename(columns={"NAME_LATN": "region_name"})
-        elif "NUTS_NAME" in gdf.columns:
-            gdf = gdf.rename(columns={"NUTS_NAME": "region_name"})
-        return gdf[["id", "CNTR_CODE", "region_name", "geometry"]]
+        if not os.path.isdir(extract_dir):
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                zf.extractall(extract_dir)
+
+        # Find the .shp file (name can vary slightly)
+        candidates = glob.glob(os.path.join(extract_dir, "**", "*.shp"), recursive=True)
+        # Prefer the 20M, 2021, 4326 level
+        preferred = [p for p in candidates if "NUTS_RG_20M_2021_4326" in p]
+        shp_path = preferred[0] if preferred else (candidates[0] if candidates else None)
     except Exception as e:
-        st.error(f"NUTS2 shapefile load failed: {e}")
-        return None
+        st.warning(f"Extraction/read prep failed: {e}")
+
+    # 3) Read with GeoPandas
+    gdf = None
+    if shp_path and os.path.exists(shp_path):
+        try:
+            gdf = gpd.read_file(shp_path).to_crs(4326)
+        except Exception as e:
+            st.warning(f"Reading shapefile failed: {e}")
+
+    # 4) Fallback to GeoJSON (smaller, HTTP-friendly)
+    if gdf is None:
+        try:
+            st.info("Falling back to GeoJSON (GISCO)…")
+            geojson_url = "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/NUTS_RG_20M_2021_4326.geojson"
+            gdf = gpd.read_file(geojson_url).to_crs(4326)
+        except Exception as e:
+            st.error(f"GeoJSON fallback failed: {e}")
+            return None
+
+    # 5) Keep Level 2 + standardize columns
+    if "LEVL_CODE" in gdf.columns:
+        gdf = gdf[gdf["LEVL_CODE"] == 2]
+    if "NUTS_ID" in gdf.columns:
+        gdf = gdf.rename(columns={"NUTS_ID": "id"})
+    if "NAME_LATN" in gdf.columns:
+        gdf = gdf.rename(columns={"NAME_LATN": "region_name"})
+    elif "NUTS_NAME" in gdf.columns:
+        gdf = gdf.rename(columns={"NUTS_NAME": "region_name"})
+
+    keep_cols = [c for c in ["id", "CNTR_CODE", "region_name", "geometry"] if c in gdf.columns]
+    return gdf[keep_cols]
 
 # ---------- Sidebar Controls ----------
 scenarios_all = [
