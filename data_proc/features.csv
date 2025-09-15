@@ -1,7 +1,0 @@
-region_id,scenario,heat_tmax_delta,heatwave_days,drought_spei,tourism_gdp_share,seasonality_idx,projected_drop,readiness_proxy,region_name,lat,lon
-R1,rcp45,2.0,10,-1.0,0.35,0.6,0.1,0.6,Region A,43.0,-7.5
-R2,rcp45,1.5,8,-0.5,0.15,0.4,0.05,0.8,Region B,47.5,12.5
-R3,rcp45,3.0,15,-1.5,0.55,0.8,0.25,0.4,Region C,52.5,22.5
-R1,rcp85,2.5,12,-1.2,0.35,0.6,0.1,0.6,Region A,43.0,-7.5
-R2,rcp85,2.0,9,-0.7,0.15,0.4,0.05,0.8,Region B,47.5,12.5
-R3,rcp85,3.5,18,-1.8,0.55,0.8,0.25,0.4,Region C,52.5,22.5
