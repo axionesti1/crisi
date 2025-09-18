@@ -15,6 +15,10 @@ import folium
 from streamlit_folium import st_folium
 from sklearn.ensemble import RandomForestRegressor
 
+from cba.climate_risk import adjust_for_risk
+from cba.economic import apply_shadow_prices, eirr, enpv
+from cba.externalities import add_externalities, carbon_cashflow
+from cba.financial import irr, npv, payback_period
 # ---------- Streamlit page setup ----------
 st.set_page_config(page_title="CRISI Model Explorer", layout="wide")
 st.title("🌍 CRISI: Climate Resilience Investment Scoring")
@@ -246,6 +250,254 @@ for sc in selected_scenarios:
         years, cf, ts, rb, w_heat, w_gdp, alpha, beta, gamma
     )
 
+# ---------- Advanced: Investment cost-benefit analysis ----------
+with st.expander("Advanced: Investment cost-benefit analysis"):
+    st.markdown(
+        "Configure investment, operating, and climate parameters to quantify the "
+        "financial and economic performance of the project under each selected scenario."
+    )
+
+    min_year = int(years.min())
+    max_year = int(years.max())
+
+    with st.form("cba_form"):
+        col_a, col_b = st.columns(2)
+        with col_a:
+            cba_start = st.number_input(
+                "Start year", min_value=min_year, max_value=max_year, value=min_year, step=1
+            )
+        with col_b:
+            cba_end = st.number_input(
+                "End year", min_value=min_year, max_value=max_year, value=min_year + 10, step=1
+            )
+
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            initial_invest = st.number_input(
+                "Initial investment (EUR)", min_value=0.0, value=5_000_000.0, step=100_000.0
+            )
+        with col2:
+            base_revenue = st.number_input(
+                "Annual revenue in start year (EUR)", value=1_200_000.0, step=50_000.0
+            )
+        with col3:
+            revenue_growth_pct = st.number_input(
+                "Annual revenue growth (%)", value=2.0, step=0.5, format="%0.2f"
+            )
+
+        col4, col5, col6 = st.columns(3)
+        with col4:
+            operating_cost = st.number_input(
+                "Annual operating cost (EUR)", min_value=0.0, value=350_000.0, step=25_000.0
+            )
+        with col5:
+            discount_rate_pct = st.number_input(
+                "Financial discount rate (%)", min_value=0.0, value=6.0, step=0.25, format="%0.2f"
+            )
+        with col6:
+            social_discount_rate_pct = st.number_input(
+                "Social discount rate (%)", min_value=0.0, value=4.0, step=0.25, format="%0.2f"
+            )
+
+        col7, col8, col9 = st.columns(3)
+        with col7:
+            resilience_uplift = st.number_input(
+                "Revenue uplift per resilience point",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.2,
+                step=0.05,
+            )
+        with col8:
+            risk_exposure_share = st.number_input(
+                "Share of revenue exposed to climate risk",
+                min_value=0.0,
+                max_value=1.0,
+                value=0.6,
+                step=0.05,
+            )
+        with col9:
+            adaptation_cost = st.number_input(
+                "Additional adaptation O&M (EUR/yr)", min_value=0.0, value=0.0, step=10_000.0
+            )
+
+        col10, col11, col12 = st.columns(3)
+        with col10:
+            annual_emissions = st.number_input(
+                "Net emissions in start year (tCO₂e)", value=0.0, step=25.0, format="%0.2f"
+            )
+        with col11:
+            emission_trend_pct = st.number_input(
+                "Annual emissions change (%)", value=-2.0, step=0.5, format="%0.2f"
+            )
+        with col12:
+            carbon_price_start = st.number_input(
+                "Carbon price in start year (€/tCO₂e)", min_value=0.0, value=80.0, step=5.0
+            )
+
+        col13, col14 = st.columns(2)
+        with col13:
+            carbon_price_growth_pct = st.number_input(
+                "Annual carbon price growth (%)", value=2.0, step=0.5, format="%0.2f"
+            )
+        with col14:
+            shadow_factor = st.number_input(
+                "Shadow price factor (economic analysis)", min_value=0.0, value=1.0, step=0.05
+            )
+
+        run_cba = st.form_submit_button("Run analysis")
+
+    if run_cba:
+        if cba_end < cba_start:
+            st.error("End year must be greater than or equal to the start year.")
+        else:
+            analysis_years = np.arange(cba_start, cba_end + 1)
+            revenue_growth = revenue_growth_pct / 100.0
+            discount_rate = discount_rate_pct / 100.0
+            social_discount_rate = social_discount_rate_pct / 100.0
+            emission_trend = emission_trend_pct / 100.0
+            carbon_price_growth = carbon_price_growth_pct / 100.0
+
+            if not results_by_scenario:
+                st.info("No scenarios selected for comparison.")
+            else:
+                summary_rows = []
+                detail_tables = {}
+
+                for sc, df in results_by_scenario.items():
+                    scenario_df = df.reindex(analysis_years).interpolate().ffill().bfill()
+
+                    gross_cf = {}
+                    climate_losses = {}
+                    emissions = {}
+                    yearly_records = []
+
+                    for idx, year in enumerate(analysis_years):
+                        resilience_val = float(scenario_df.loc[year, "Resilience"])
+                        risk_val = float(scenario_df.loc[year, "Risk"])
+
+                        revenue_nominal = base_revenue * ((1 + revenue_growth) ** idx)
+                        revenue_adjusted = revenue_nominal * (1 + resilience_uplift * (resilience_val - 0.5))
+                        revenue_adjusted = max(revenue_adjusted, 0.0)
+
+                        annual_cash = revenue_adjusted - operating_cost - adaptation_cost
+                        if year == cba_start:
+                            annual_cash -= initial_invest
+
+                        gross_cf[year] = annual_cash
+
+                        climate_loss = max(revenue_adjusted * risk_val * risk_exposure_share, 0.0)
+                        climate_losses[year] = climate_loss
+
+                        emission_val = annual_emissions * ((1 + emission_trend) ** idx)
+                        emissions[year] = emission_val
+
+                        yearly_records.append(
+                            {
+                                "Year": year,
+                                "Resilience": resilience_val,
+                                "Risk": risk_val,
+                                "Revenue (resilience-adjusted)": revenue_adjusted,
+                                "Gross cashflow": annual_cash,
+                                "Expected climate loss": climate_loss,
+                                "Net emissions (tCO₂e)": emission_val,
+                            }
+                        )
+
+                    risk_adj_cf = adjust_for_risk(gross_cf, climate_losses)
+
+                    carbon_price_path = {
+                        year: carbon_price_start * ((1 + carbon_price_growth) ** (year - cba_start))
+                        for year in analysis_years
+                    }
+                    carbon_cf = carbon_cashflow(emissions, carbon_price_path)
+                    econ_cf = add_externalities(risk_adj_cf, carbon_cf)
+                    econ_shadow = apply_shadow_prices(econ_cf, {"non_traded": shadow_factor})
+
+                    for record in yearly_records:
+                        year = record["Year"]
+                        record["Risk-adjusted cashflow"] = risk_adj_cf.get(year, 0.0)
+                        record["Carbon externality"] = carbon_cf.get(year, 0.0)
+                        record["Economic cashflow (shadow)"] = econ_shadow.get(year, 0.0)
+
+                    try:
+                        fin_npv = npv(risk_adj_cf, discount_rate)
+                    except Exception:
+                        fin_npv = float("nan")
+
+                    try:
+                        fin_irr = irr(risk_adj_cf) * 100
+                    except Exception:
+                        fin_irr = float("nan")
+
+                    payback = payback_period(risk_adj_cf)
+
+                    try:
+                        econ_npv = enpv(econ_shadow, social_discount_rate)
+                    except Exception:
+                        econ_npv = float("nan")
+
+                    try:
+                        econ_irr = eirr(econ_shadow) * 100
+                    except Exception:
+                        econ_irr = float("nan")
+
+                    total_benefits = sum(v for v in risk_adj_cf.values() if v > 0)
+                    total_costs = -sum(v for v in risk_adj_cf.values() if v < 0)
+                    bcr = (total_benefits / total_costs) if total_costs else float("nan")
+
+                    summary_rows.append(
+                        {
+                            "Scenario": sc,
+                            "Financial NPV (€)": fin_npv,
+                            "Financial IRR (%)": fin_irr,
+                            "Payback (years)": payback,
+                            "Benefit-cost ratio": bcr,
+                            "Economic NPV (€)": econ_npv,
+                            "Economic IRR (%)": econ_irr,
+                        }
+                    )
+
+                    detail_tables[sc] = pd.DataFrame(yearly_records).set_index("Year")
+
+                if summary_rows:
+                    summary_df = pd.DataFrame(summary_rows).set_index("Scenario")
+                    st.success("Cost-benefit analysis complete.")
+                    st.dataframe(
+                        summary_df.style.format(
+                            {
+                                "Financial NPV (€)": "{:,.0f}",
+                                "Financial IRR (%)": "{:,.2f}",
+                                "Payback (years)": "{:.0f}",
+                                "Benefit-cost ratio": "{:,.2f}",
+                                "Economic NPV (€)": "{:,.0f}",
+                                "Economic IRR (%)": "{:,.2f}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+
+                    detail_tabs = st.tabs(list(detail_tables.keys()))
+                    for tab, sc in zip(detail_tabs, detail_tables.keys()):
+                        with tab:
+                            st.dataframe(
+                                detail_tables[sc].style.format(
+                                    {
+                                        "Resilience": "{:.3f}",
+                                        "Risk": "{:.3f}",
+                                        "Revenue (resilience-adjusted)": "{:,.0f}",
+                                        "Gross cashflow": "{:,.0f}",
+                                        "Expected climate loss": "{:,.0f}",
+                                        "Net emissions (tCO₂e)": "{:,.1f}",
+                                        "Risk-adjusted cashflow": "{:,.0f}",
+                                        "Carbon externality": "{:,.0f}",
+                                        "Economic cashflow (shadow)": "{:,.0f}",
+                                    }
+                                ),
+                                use_container_width=True,
+                            )
+                else:
+                    st.info("No results to display for the configured inputs.")
 # ---------- Visuals: Time-series ----------
 st.subheader("Resilience projection (2025–2055)")
 plot_df = pd.concat(
