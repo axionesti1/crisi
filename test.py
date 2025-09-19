@@ -796,7 +796,7 @@ if nuts2 is not None and not scenario_scores.empty:
         legend_name="Resilience score (latest)",
     ).add_to(fmap)
 
-     label_candidates = []
+    label_candidates = []
     if region_name_col:
         label_candidates.extend(
             [region_name_col, f"{region_name_col}_x", f"{region_name_col}_y"]
