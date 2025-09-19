@@ -165,7 +165,7 @@ def prepare_training_dataset(
 ) -> tuple[pd.DataFrame, list[str]]:
     df = features_df.copy()
     df["resilience_score"] = scores_df["resilience_score"]
- numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+    numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
     drop_cols = {"resilience_score", region_id_col, scenario_col}
     if year_col and year_col in df.columns:
         drop_cols.add(year_col)
