@@ -1,0 +1,13 @@
+weights:
+  exposure:
+    heat_tmax_delta: 0.4
+    heatwave_days: 0.4
+    drought_spei: 0.2
+  sensitivity:
+    tourism_gdp_share: 0.6
+    seasonality_idx: 0.4
+  capacity:
+    readiness_proxy: -0.2
+thresholds:
+  tourism_gdp_share_high: 15
+  projected_drop_high: 10
