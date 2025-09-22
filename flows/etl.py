@@ -283,29 +283,30 @@ def canonical_climate_column(variable_name: str) -> Optional[str]:
         return "drought_spei"
     return None
 
+import pandera.pandas as pa
+from pandera.pandas import Column, DataFrameSchema, Check
+from typing import Iterable, Dict
 
 def make_final_schema(allowed_scenarios: Iterable[str]) -> DataFrameSchema:
     scenario_values = sorted({str(s) for s in allowed_scenarios if s is not None})
+
     columns: Dict[str, Column] = {
         "region_id": Column(str, nullable=False),
         "region_name": Column(str, nullable=True),
-        "year": Column(int, Check.in_range(1950, 2100)),
-        "heat_tmax_delta": Column(float, nullable=True, checks=Check.in_range(-5, 10)),
-        "heatwave_days": Column(float, nullable=True, checks=Check.ge(0)),
+        "year": Column(int, checks=[Check.ge(1950), Check.le(2100)], nullable=False),
+        "heat_tmax_delta": Column(float, nullable=True, checks=[Check.ge(-5), Check.le(10)]),
+        "heatwave_days": Column(float, nullable=True, checks=[Check.ge(0)]),
         "drought_spei": Column(float, nullable=True),
-        "tourism_gdp_share": Column(float, nullable=True, checks=Check.in_range(0, 100, inclusive="both")),
-        "seasonality_idx": Column(float, nullable=True, checks=Check.in_range(0, 100, inclusive="both")),
+        "tourism_gdp_share": Column(float, nullable=True, checks=[Check.ge(0), Check.le(100)]),
+        "seasonality_idx": Column(float, nullable=True, checks=[Check.ge(0), Check.le(100)]),
         "readiness_proxy": Column(float, nullable=True),
         "projected_drop": Column(float, nullable=True),
     }
 
     if scenario_values:
-        columns["scenario"] = Column(str, nullable=False, checks=Check.isin(scenario_values))
-    else:
-        columns["scenario"] = Column(str, nullable=False)
+        columns["scenario"] = Column(str, nullable=False, checks=[Check.isin(scenario_values)])
 
-    return DataFrameSchema(columns, coerce=True)
-
+    return DataFrameSchema(columns)
 
 @dataclass
 class ClimateRow:
