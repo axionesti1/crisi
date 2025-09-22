@@ -16,29 +16,22 @@ import logging
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import geopandas as gpd
 import numpy as np
 import pandas as pd
-from pandera import Column, DataFrameSchema, Check
+
+# ✅ Use the non-deprecated Pandera import path (NumPy 2.0 compatible in recent versions)
 import pandera.pandas as pa
 from pandera.pandas import Column, DataFrameSchema, Check
-
-# now this works on recent versions
-Column(float, checks=Check.between(0, 100, inclusive="both"))
-
-# External service clients are imported lazily in the functions that use them so
-# that the pipeline can operate in environments where optional dependencies are
-# unavailable or where network access is restricted.
 
 LOGGER = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Configuration dataclasses
+# Configuration
 # ---------------------------------------------------------------------------
-
 
 def project_root() -> Path:
     return Path(__file__).resolve().parents[1]
@@ -62,16 +55,14 @@ class CliArgs:
 # Utilities
 # ---------------------------------------------------------------------------
 
-
 def ensure_directories() -> None:
-    for folder in [RAW_DIR / "cds", INTERIM_DIR, PROCESSED_DIR]:
+    for folder in [RAW_DIR / "cds", RAW_DIR, INTERIM_DIR, PROCESSED_DIR]:
         folder.mkdir(parents=True, exist_ok=True)
     LOGGER.debug("Ensured data directories exist under %s", DATA_DIR)
 
 
 def read_yaml(path: Path) -> dict:
     import yaml  # deferred import
-
     with path.open("r", encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
@@ -82,62 +73,92 @@ def write_geo_dataframe(df: gpd.GeoDataFrame, path: Path) -> None:
     LOGGER.info("Wrote %s rows to %s", len(df), path)
 
 
+def _pick(df: pd.DataFrame, candidates: Tuple[str, ...]) -> str:
+    """Return the first matching column name by case-insensitive search."""
+    cols_lower = {c.lower(): c for c in df.columns}
+    for c in candidates:
+        if c in df.columns:
+            return c
+        if c.lower() in cols_lower:
+            return cols_lower[c.lower()]
+    raise KeyError(f"None of {candidates} found in columns: {list(df.columns)}")
+
+
 # ---------------------------------------------------------------------------
 # GISCO NUTS-2 downloader
 # ---------------------------------------------------------------------------
 
-
 def download_nuts2(force: bool = False) -> gpd.GeoDataFrame:
-    """Download GISCO NUTS-2 polygons and store them locally.
+    """Download GISCO NUTS-2 polygons and store locally.
 
-    The implementation follows the official GISCO distribution endpoint
-    documented at https://gisco-services.ec.europa.eu/distribution/v2/nuts/download/  # noqa: E501  [GISCO]
+    Uses the official GISCO distribution endpoint.
+    https://gisco-services.ec.europa.eu/distribution/v2/nuts/download/
     """
-
     target_path = INTERIM_DIR / "nuts2.parquet"
     if target_path.exists() and not force:
         LOGGER.info("Loading cached NUTS-2 dataset from %s", target_path)
         return gpd.read_parquet(target_path)
 
-    url = (
-        "https://gisco-services.ec.europa.eu/distribution/v2/nuts/gpkg/"
-        "NUTS_RG_01M_2024_4326.gpkg"
+    # Prefer GeoJSON (streams well); fall back to download GPKG locally.
+    geojson_url = (
+        "https://gisco-services.ec.europa.eu/distribution/v2/nuts/geojson/"
+        "NUTS_RG_01M_2024_4326.geojson"
     )
-    LOGGER.info("Requesting NUTS-2 polygons from %s", url)
+    LOGGER.info("Requesting NUTS-2 polygons from %s", geojson_url)
 
     try:
-        import requests
+        gdf = gpd.read_file(geojson_url)
+        LOGGER.info("Fetched %s rows from GISCO (GeoJSON)", len(gdf))
+    except Exception as exc_json:
+        LOGGER.warning("GeoJSON read failed (%s), trying GPKG download...", exc_json)
+        try:
+            import requests
+            gpkg_url = (
+                "https://gisco-services.ec.europa.eu/distribution/v2/nuts/gpkg/"
+                "NUTS_RG_01M_2024_4326.gpkg"
+            )
+            r = requests.get(gpkg_url, timeout=60)
+            r.raise_for_status()
+            local = RAW_DIR / "NUTS_RG_01M_2024_4326.gpkg"
+            local.write_bytes(r.content)
+            gdf = gpd.read_file(local, layer="NUTS_RG_01M_2024_4326")
+            LOGGER.info("Fetched %s rows from GISCO (GPKG)", len(gdf))
+        except Exception as exc_gpkg:
+            LOGGER.warning("Falling back to sample NUTS geometries due to: %s", exc_gpkg)
+            from shapely.geometry import box
+            gdf = gpd.GeoDataFrame(
+                {
+                    "NUTS_ID": ["ES62", "FR10"],
+                    "NAME_LATN": ["Murcia", "Île-de-France"],
+                    "CNTR_CODE": ["ES", "FR"],
+                    "LEVL_CODE": [2, 2],
+                    "geometry": [
+                        box(-1.5, 37.5, -0.5, 38.5),
+                        box(1.5, 48.0, 3.5, 49.0),
+                    ],
+                },
+                crs="EPSG:4326",
+            )
 
-        session = requests.Session()
-        retries = requests.adapters.Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-        adapter = requests.adapters.HTTPAdapter(max_retries=retries)
-        session.mount("https://", adapter)
-        response = session.get(url, timeout=60)
-        response.raise_for_status()
+    if "LEVL_CODE" in gdf.columns:
+        gdf = gdf[gdf["LEVL_CODE"].eq(2)].copy()
 
-        temp_path = RAW_DIR / "nuts.gpkg"
-        temp_path.parent.mkdir(parents=True, exist_ok=True)
-        temp_path.write_bytes(response.content)
-        gdf = gpd.read_file(temp_path, layer="NUTS_RG_01M_2024_4326")
-        LOGGER.info("Fetched %s rows from GISCO", len(gdf))
-    except Exception as exc:  # broad catch to support offline execution
-        LOGGER.warning("Falling back to sample NUTS geometries due to: %s", exc)
-        from shapely.geometry import box
+    keep_cols = [c for c in ["NUTS_ID", "NAME_LATN", "CNTR_CODE", "geometry"] if c in gdf.columns]
+    nuts2 = gdf[keep_cols].copy()
+    nuts2 = nuts2.rename(
+        columns={
+            "NUTS_ID": "region_id",
+            "NAME_LATN": "region_name",
+            "CNTR_CODE": "country_code",
+        }
+    )
+    # Optional: compute area_km2 (use equal-area projection)
+    try:
+        nuts2_area = nuts2.to_crs(3035)
+        nuts2["area_km2"] = nuts2_area.geometry.area / 1e6
+    except Exception:
+        nuts2["area_km2"] = np.nan
 
-        gdf = gpd.GeoDataFrame(
-            {
-                "NUTS_ID": ["ES62", "FR10"],
-                "NAME_LATN": ["Murcia", "Île-de-France"],
-                "geometry": [
-                    box(-1.5, 37.5, -0.5, 38.5),
-                    box(1.5, 48.0, 3.5, 49.0),
-                ],
-            },
-            crs="EPSG:4326",
-        )
-
-    nuts2 = gdf.loc[gdf["LEVL_CODE"].eq(2) if "LEVL_CODE" in gdf else slice(None), ["NUTS_ID", "NAME_LATN", "geometry"]].copy()
-    nuts2 = nuts2.rename(columns={"NUTS_ID": "region_id", "NAME_LATN": "region_name"})
     write_geo_dataframe(nuts2, target_path)
     return nuts2
 
@@ -146,68 +167,103 @@ def download_nuts2(force: bool = False) -> gpd.GeoDataFrame:
 # Eurostat tourism + GDP retrieval via pandaSDMX
 # ---------------------------------------------------------------------------
 
+def _sdmx_to_df(series_like) -> pd.DataFrame:
+    """Convert SDMX Series/MultiIndex to a tidy DataFrame with robust column naming."""
+    df = series_like.reset_index()
+    # Value column sometimes ends up as 0 if the object was a Series
+    if "value" not in df.columns:
+        # assume the last column is value if unnamed
+        df = df.rename(columns={df.columns[-1]: "value"})
+    # Normalize dimension names
+    rename_map = {}
+    for cand, target in [
+        (("geo", "GEO"), "region_id"),
+        (("time_period", "TIME_PERIOD", "time", "TIME"), "period"),
+        (("freq", "FREQ"), "freq"),
+        (("unit", "UNIT"), "unit"),
+    ]:
+        for c in cand:
+            if c in df.columns:
+                rename_map[c] = target
+                break
+    df = df.rename(columns=rename_map)
+    return df
+
 
 def fetch_eurostat_tourism(force: bool = False) -> pd.DataFrame:
     """Retrieve Eurostat tourism datasets with pandaSDMX.
 
-    Uses the API documented at https://pandasdmx.readthedocs.io/en/v0.9/usage.html  # noqa: E501  [Eurostat/pandaSDMX]
-    and datasets tour_occ_arn2/tour_occ_nin2 for arrivals/nights.
+    Uses datasets tour_occ_arn2/tour_occ_nin2 for arrivals/nights.
     """
-
     target_path = INTERIM_DIR / "eurostat_tourism.parquet"
     if target_path.exists() and not force:
         LOGGER.info("Loading cached Eurostat tourism table from %s", target_path)
         return pd.read_parquet(target_path)
 
     try:
+        # Provider name can be "ESTAT" or "EUROSTAT" depending on pandasdmx version
         from pandasdmx import Request  # type: ignore
 
-        client = Request("EUROSTAT")
-        dataset_id = "tour_occ_nin2"
+        try:
+            client = Request("ESTAT")
+        except Exception:
+            client = Request("EUROSTAT")
+
+        dataset_id = "tour_occ_nin2"  # nights
         LOGGER.info("Querying Eurostat dataset %s via pandaSDMX", dataset_id)
-        # Request a recent slice of monthly data with GEO dimension at NUTS-2.
+        # Request all; you may restrict with params for speed
         data_response = client.data(resource_id=dataset_id, key=".")
-        data_df = data_response.to_pandas()  # MultiIndex Series
-        df = data_df.reset_index()
-        df = df.rename(columns={"geo": "region_id", "time_period": "period"})
-        # Extract year and month if available
-        if df["period"].str.contains("-", na=False).any():
-            period = df["period"].str.split("-", expand=True)
-            df["year"] = period[0].astype(int)
-            df["month"] = period[1].astype(int)
+        df = _sdmx_to_df(data_response.to_pandas())
+
+        # Parse period to year/month when possible
+        period_col = _pick(df, ("period",))
+        df["period"] = df[period_col].astype(str)
+        # Common formats: "2020", "2020-01", "2020M01"
+        def _split_period(s: str) -> Tuple[int, Optional[int]]:
+            s = s.strip()
+            if "-" in s:
+                y, m = s.split("-", 1)
+                return int(y), int(m)
+            if "M" in s.upper():
+                y, m = s.upper().split("M", 1)
+                return int(y), int(m)
+            return int(s), None
+
+        ym = df["period"].map(_split_period)
+        df["year"] = [t[0] for t in ym]
+        df["month"] = [t[1] for t in ym]
+
+        region_col = _pick(df, ("region_id",))
+        df["region_id"] = df[region_col]
+
+        # Compute seasonality index when monthly data exist: top 3 months share (%)
+        df["value"] = pd.to_numeric(df["value"], errors="coerce")
+        if df["month"].notna().any():
+            monthly = df.dropna(subset=["month"]).copy()
+            seasonality = (
+                monthly.groupby(["region_id", "year"], dropna=True)
+                .apply(lambda x: x.nlargest(3, "value")["value"].sum() / x["value"].sum() * 100.0)
+                .rename("seasonality_idx")
+                .reset_index()
+            )
         else:
-            df["year"] = df["period"].astype(int)
-            df["month"] = np.nan
-        df = df.rename(columns={0: "value"})
+            # If only annual totals, we cannot compute a true seasonality index
+            seasonality = (
+                df.groupby(["region_id", "year"], dropna=True)["value"].sum()
+                .rename("seasonality_idx")
+                .reset_index()
+            )
+            seasonality["seasonality_idx"] = np.nan
+
     except Exception as exc:
         LOGGER.warning("Falling back to synthetic tourism data due to: %s", exc)
-        sample = {
-            "region_id": ["ES62", "ES62", "FR10", "FR10"],
-            "year": [2030, 2050, 2030, 2050],
-            "month": [np.nan, np.nan, np.nan, np.nan],
-            "value": [1.2e6, 1.4e6, 3.1e6, 3.3e6],
-        }
-        df = pd.DataFrame(sample)
-        df["period"] = df["year"].astype(str)
-
-    # Compute seasonality index: share of top 3 months of nights. If monthly
-    # data available, calculate; otherwise fall back to NaN.
-    if df["month"].notna().any():
-        nights = df.dropna(subset=["month"]).copy()
-        nights["value"] = pd.to_numeric(nights["value"], errors="coerce")
-        seasonality = (
-            nights.groupby(["region_id", "year"], dropna=True)
-            .apply(lambda x: x.nlargest(3, "value")["value"].sum() / x["value"].sum() * 100)
-            .rename("seasonality_idx")
-            .reset_index()
+        seasonality = pd.DataFrame(
+            {
+                "region_id": ["ES62", "ES62", "FR10", "FR10"],
+                "year": [2030, 2050, 2030, 2050],
+                "seasonality_idx": [np.nan, np.nan, np.nan, np.nan],
+            }
         )
-    else:
-        seasonality = (
-            df.groupby(["region_id", "year"], dropna=True)["value"].sum()
-            .rename("seasonality_idx")
-            .reset_index()
-        )
-        seasonality["seasonality_idx"] = np.nan
 
     seasonality.to_parquet(target_path, index=False)
     LOGGER.info("Wrote cleaned tourism data to %s", target_path)
@@ -223,21 +279,32 @@ def fetch_eurostat_gdp(force: bool = False) -> pd.DataFrame:
     try:
         from pandasdmx import Request  # type: ignore
 
-        client = Request("EUROSTAT")
+        try:
+            client = Request("ESTAT")
+        except Exception:
+            client = Request("EUROSTAT")
+
         dataset_id = "nama_10r_2gdp"
         LOGGER.info("Querying Eurostat dataset %s via pandaSDMX", dataset_id)
         data_response = client.data(resource_id=dataset_id, key=".")
-        data_df = data_response.to_pandas()
-        df = data_df.reset_index().rename(columns={"geo": "region_id", "time_period": "year", 0: "gdp"})
-        df["year"] = df["year"].astype(int)
+        df = _sdmx_to_df(data_response.to_pandas())
+
+        region_col = _pick(df, ("region_id",))
+        period_col = _pick(df, ("period",))
+        df = df.rename(columns={region_col: "region_id", period_col: "year"})
+        df["year"] = df["year"].astype(str).str.slice(0, 4).astype(int)
+        df = df.rename(columns={"value": "gdp"})
+        df["gdp"] = pd.to_numeric(df["gdp"], errors="coerce")
+
+        # Keep a recent slice to shrink file size (optional)
+        if df["year"].notna().any():
+            recent_min = max(df["year"].min(), 2010)
+            df = df[df["year"] >= recent_min].copy()
+
     except Exception as exc:
         LOGGER.warning("Falling back to synthetic GDP data due to: %s", exc)
         df = pd.DataFrame(
-            {
-                "region_id": ["ES62", "FR10"],
-                "year": [2030, 2030],
-                "gdp": [45_000.0, 350_000.0],
-            }
+            {"region_id": ["ES62", "FR10"], "year": [2030, 2030], "gdp": [45_000.0, 350_000.0]}
         )
 
     df.to_parquet(target_path, index=False)
@@ -248,7 +315,6 @@ def fetch_eurostat_gdp(force: bool = False) -> pd.DataFrame:
 # ---------------------------------------------------------------------------
 # CDS climate retrieval and zonal statistics
 # ---------------------------------------------------------------------------
-
 
 def load_cds_config() -> dict:
     cfg_path = CONFIG_DIR / "cds_requests.yml"
@@ -273,7 +339,6 @@ def load_cds_config() -> dict:
 
 def canonical_climate_column(variable_name: str) -> Optional[str]:
     """Map dataset-specific variable names to canonical CRISI columns."""
-
     name = variable_name.lower()
     if "tmax" in name or "temperature" in name:
         return "heat_tmax_delta"
@@ -283,9 +348,6 @@ def canonical_climate_column(variable_name: str) -> Optional[str]:
         return "drought_spei"
     return None
 
-import pandera.pandas as pa
-from pandera.pandas import Column, DataFrameSchema, Check
-from typing import Iterable, Dict
 
 def make_final_schema(allowed_scenarios: Iterable[str]) -> DataFrameSchema:
     scenario_values = sorted({str(s) for s in allowed_scenarios if s is not None})
@@ -302,11 +364,10 @@ def make_final_schema(allowed_scenarios: Iterable[str]) -> DataFrameSchema:
         "readiness_proxy": Column(float, nullable=True),
         "projected_drop": Column(float, nullable=True),
     }
-
     if scenario_values:
         columns["scenario"] = Column(str, nullable=False, checks=[Check.isin(scenario_values)])
-
     return DataFrameSchema(columns)
+
 
 @dataclass
 class ClimateRow:
@@ -320,9 +381,8 @@ class ClimateRow:
 
 def compute_zonal_stats_raster(raster, geometries: gpd.GeoDataFrame) -> pd.Series:
     """Compute mean zonal statistics for a raster over provided geometries."""
-
-    import rioxarray  # noqa: F401  # needed for rio accessor
-
+    # Ensure rioxarray accessor is registered
+    import rioxarray  # noqa: F401
     stats: List[float] = []
     for _, row in geometries.iterrows():
         clipped = raster.rio.clip([row.geometry], geometries.crs, drop=False)
@@ -332,7 +392,6 @@ def compute_zonal_stats_raster(raster, geometries: gpd.GeoDataFrame) -> pd.Serie
 
 def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd.DataFrame:
     """Download CDS NetCDFs and aggregate to NUTS-2."""
-
     target_path = INTERIM_DIR / "climate.parquet"
     if target_path.exists() and not force:
         LOGGER.info("Loading cached climate aggregates from %s", target_path)
@@ -354,16 +413,15 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
     try:
         from cdsapi import Client  # type: ignore
         import xarray as xr
+        import rioxarray  # noqa: F401
 
-        client = Client()  # Authentication handled via ~/.cdsapirc; see docs.  [CDS]
+        client = Client()  # uses ~/.cdsapirc
 
         baseline_means = {}
         if baseline_years:
             baseline_file = raw_dir / f"{dataset}_baseline.nc"
             if not baseline_file.exists() or force:
-                baseline_scenario = baseline_cfg.get("scenario")
-                if baseline_scenario is None and scenarios:
-                    baseline_scenario = scenarios[0]
+                baseline_scenario = baseline_cfg.get("scenario") or (scenarios[0] if scenarios else None)
                 request_experiment = scenario_request_map.get(baseline_scenario, baseline_scenario)
                 request = {
                     "format": "netcdf",
@@ -375,7 +433,11 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
                 client.retrieve(dataset, request, str(baseline_file))
             ds_base = xr.open_dataset(baseline_file)
             for var in variables:
-                baseline_means[var] = ds_base[var].mean().item()
+                if var in ds_base:
+                    baseline_means[var] = float(ds_base[var].mean().item())
+
+        # Reproject nuts to EPSG:4326 for consistent clipping if needed
+        nuts_wgs = nuts_gdf.to_crs("EPSG:4326")
 
         for scenario in scenarios:
             for year in years:
@@ -391,18 +453,23 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
                     LOGGER.info("Retrieving CDS file: %s", json.dumps(request))
                     client.retrieve(dataset, request, str(filename))
 
+                import xarray as xr  # local
                 ds = xr.open_dataset(filename)
-                scenario_df = nuts_gdf[["region_id"]].copy()
+
+                scenario_df = nuts_wgs[["region_id"]].copy()
                 scenario_df["scenario"] = scenario
                 scenario_df["year"] = int(year)
                 scenario_df[["heat_tmax_delta", "heatwave_days", "drought_spei"]] = np.nan
 
                 for var in variables:
+                    if var not in ds:
+                        LOGGER.debug("Variable %s not in dataset; skipping", var)
+                        continue
                     data = ds[var]
-                    if not data.rio.crs:
+                    # Ensure CRS on data for rioxarray
+                    if not getattr(data, "rio", None) or not data.rio.crs:
                         data = data.rio.write_crs("EPSG:4326")
-                    data = data.rio.reproject(nuts_gdf.crs)
-                    stats = compute_zonal_stats_raster(data, nuts_gdf)
+                    stats = compute_zonal_stats_raster(data, nuts_wgs)
                     baseline = baseline_means.get(var)
                     values = stats - baseline if baseline is not None else stats
 
@@ -410,25 +477,16 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
                     if column is None:
                         LOGGER.debug("Ignoring climate variable %s (no canonical mapping)", var)
                         continue
-
-                    scenario_df[column] = values
+                    scenario_df[column] = values.values
 
                 rows.extend(
                     ClimateRow(
                         region_id=row.region_id,
                         scenario=row.scenario,
                         year=row.year,
-                        heat_tmax_delta=(
-                            float(row.heat_tmax_delta)
-                            if pd.notna(row.heat_tmax_delta)
-                            else None
-                        ),
-                        heatwave_days=(
-                            float(row.heatwave_days) if pd.notna(row.heatwave_days) else None
-                        ),
-                        drought_spei=(
-                            float(row.drought_spei) if pd.notna(row.drought_spei) else None
-                        ),
+                        heat_tmax_delta=(float(row.heat_tmax_delta) if pd.notna(row.heat_tmax_delta) else None),
+                        heatwave_days=(float(row.heatwave_days) if pd.notna(row.heatwave_days) else None),
+                        drought_spei=(float(row.drought_spei) if pd.notna(row.drought_spei) else None),
                     )
                     for row in scenario_df.itertuples(index=False)
                 )
@@ -437,14 +495,7 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
         rng = np.random.default_rng(42)
         fallback_scenarios = scenarios or ["Baseline", "Conservative", "Moderate", "High", "Extreme"]
         fallback_years = years or [2030, 2050]
-        severity_lookup = {
-            "Baseline": 0.5,
-            "Conservative": 1.0,
-            "Moderate": 1.5,
-            "High": 2.0,
-            "Extreme": 2.5,
-        }
-
+        severity_lookup = {"Baseline": 0.5, "Conservative": 1.0, "Moderate": 1.5, "High": 2.0, "Extreme": 2.5}
         for scenario in fallback_scenarios:
             for year in fallback_years:
                 for region_id in nuts_gdf["region_id"].tolist():
@@ -461,14 +512,11 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
                     )
 
     climate_df = pd.DataFrame([row.__dict__ for row in rows])
-    climate_df = (
-        climate_df.groupby(["region_id", "scenario", "year"], as_index=False)
-        .agg({
-            "heat_tmax_delta": "mean",
-            "heatwave_days": "mean",
-            "drought_spei": "mean",
-        })
-    )
+    if not climate_df.empty:
+        climate_df = (
+            climate_df.groupby(["region_id", "scenario", "year"], as_index=False)
+            .agg({"heat_tmax_delta": "mean", "heatwave_days": "mean", "drought_spei": "mean"})
+        )
     climate_df.to_parquet(target_path, index=False)
     LOGGER.info("Wrote climate aggregates to %s", target_path)
     return climate_df
@@ -477,7 +525,6 @@ def aggregate_cds_to_nuts(nuts_gdf: gpd.GeoDataFrame, force: bool = False) -> pd
 # ---------------------------------------------------------------------------
 # Final assembly & validation
 # ---------------------------------------------------------------------------
-
 
 def load_settings() -> dict:
     cfg_path = CONFIG_DIR / "settings.yml"
@@ -526,7 +573,9 @@ def build_final_features(
     # Optionally use GDP for future ratios. Currently unused but kept for completeness.
     features = features.merge(gdp, on=["region_id", "year"], how="left", suffixes=("", "_gdp"))
 
-    features = features.merge(nuts[["region_id", "region_name", "geometry"]], on="region_id", how="left")
+    # Join names/geometry
+    keep_geo = [c for c in ["region_id", "region_name", "geometry"] if c in nuts.columns]
+    features = features.merge(nuts[keep_geo], on="region_id", how="left")
 
     # Add empty columns required by schema
     for col in ["readiness_proxy", "projected_drop"]:
@@ -534,7 +583,7 @@ def build_final_features(
             features[col] = np.nan
 
     # Reorder and ensure geometry column is GeoSeries
-    features = gpd.GeoDataFrame(features, geometry="geometry", crs=nuts.crs)
+    features = gpd.GeoDataFrame(features, geometry="geometry", crs=nuts.crs if "geometry" in nuts else "EPSG:4326")
     for col in FINAL_COLUMNS:
         if col not in features:
             features[col] = np.nan
@@ -555,7 +604,6 @@ def build_final_features(
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-
 def parse_args(argv: Optional[Iterable[str]] = None) -> CliArgs:
     parser = argparse.ArgumentParser(description="CRISI ETL pipeline")
     parser.add_argument("--pull-cds", action="store_true", help="Download climate data from CDS")
@@ -566,10 +614,7 @@ def parse_args(argv: Optional[Iterable[str]] = None) -> CliArgs:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s - %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s - %(message)s")
     args = parse_args(argv)
     ensure_directories()
 
