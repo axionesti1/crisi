@@ -23,8 +23,19 @@ import numpy as np
 import pandas as pd
 
 # ✅ Use the non-deprecated Pandera import path (NumPy 2.0 compatible in recent versions)
-import pandera.pandas as pa
-from pandera.pandas import Column, DataFrameSchema, Check
+# --- Optional Pandera import (won't crash if missing) ---
+HAS_PANDERA = True
+try:
+    import pandera.pandas as pa  # noqa: F401
+    from pandera.pandas import Column, DataFrameSchema, Check
+except Exception as _pandera_exc:
+    HAS_PANDERA = False
+    # stubs so type hints don't fail; we won't call them if HAS_PANDERA=False
+    Column = DataFrameSchema = Check = object  # type: ignore
+    import logging as _lg
+    _lg.getLogger(__name__).warning(
+        "Pandera unavailable: %s — schema validation will be skipped.", _pandera_exc
+    )
 
 HAS_PANDERA = True
 try:
