@@ -1,0 +1,19 @@
+dataset: "sis-heat-and-cold-spells"
+variables:
+  - heat_wave_frequency
+scenarios:
+  - "Baseline"
+  - "Conservative"
+  - "Moderate"
+  - "High"
+  - "Extreme"
+scenario_request_map:
+  Baseline: "historical"
+  Conservative: "rcp26"
+  Moderate: "rcp45"
+  High: "rcp60"
+  Extreme: "rcp85"
+years: [2030, 2050]
+baseline:
+  years: [1981, 2010]
+  scenario: "Baseline"
