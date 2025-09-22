@@ -26,6 +26,16 @@ import pandas as pd
 import pandera.pandas as pa
 from pandera.pandas import Column, DataFrameSchema, Check
 
+HAS_PANDERA = True
+try:
+    import pandera.pandas as pa  # noqa: F401
+    from pandera.pandas import Column, DataFrameSchema, Check
+except Exception as _pandera_exc:
+    HAS_PANDERA = False
+    Column = DataFrameSchema = Check = object  # type: ignore
+    import logging as _lg
+    _lg.getLogger(__name__).warning("Pandera unavailable: %s — schema validation will be skipped.", _pandera_exc)
+
 LOGGER = logging.getLogger(__name__)
 
 
