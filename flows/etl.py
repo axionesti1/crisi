@@ -22,6 +22,11 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 from pandera import Column, DataFrameSchema, Check
+import pandera.pandas as pa
+from pandera.pandas import Column, DataFrameSchema, Check
+
+# now this works on recent versions
+Column(float, checks=Check.between(0, 100, inclusive="both"))
 
 # External service clients are imported lazily in the functions that use them so
 # that the pipeline can operate in environments where optional dependencies are
