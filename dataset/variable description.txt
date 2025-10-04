@@ -1,0 +1,22 @@
+variable	units 	description	Pilar
+population	number	Population on 1 January	Society
+pop_density	persons per square kilometre	Population density	Society
+pop_change	crude rate of total population change	Crude rates of total change, natural change and net migration plus adjustment	Society
+education	percentage (%)	Persons aged 25-64 with tertiary educational attainment level 	Society
+rnd_expe	percentage (%) of gross domestic product (GDP)	Intramural R&D expenditure (GERD)	Society
+hospital_beds	per hundred thousand inhabitants	Available beds in hospitals	Society
+at_risk_poverty	percentage (%) of total population	At-risk-of-poverty rate 	Society
+shortstay_nights_spent	number	Short-stay accommodation offered via collaborative economy platforms by months	Tourism
+gdp	million euro	Regional gross domestic product	Economy
+per_gdp	in euro	Per capita gross domestic product 	Economy
+total_nights_spent	number	Nights spent at tourist accommodation establishments	Tourism
+arrivals_at_accomond	number	Arrivals at tourist accommodation establishments	Tourism
+international_arrivals	number	International arrivals	Tourism
+total_environ_tax	in million euro	Total environmental taxes	Environment
+energy_environ_tax	in million euro	Total energy taxes	Environment
+transport_environ_tax	in million euro	Total transport taxes	Environment
+no_units	number	Number of units enterprises	Economy
+turnover	number	Turnover of entereprises	Economy
+employment	number	Employment of enterprises	Economy
+tmax		Number	Maximum temp of the month	Environment
+tmin		Number	Minimum temp of the month	Environment
