@@ -1,0 +1,29 @@
+{
+  "available_metrics": [
+    "main__arrivals_at_accomond",
+    "main__at_risk_poverty",
+    "main__education",
+    "main__employment",
+    "main__energy_environ_tax",
+    "main__gdp",
+    "main__hospital_beds",
+    "main__international_arrivals",
+    "main__no_units",
+    "main__per_gdp",
+    "main__pop_change",
+    "main__pop_density",
+    "main__population",
+    "main__rnd_expe",
+    "main__shortstay_nights_spent",
+    "main__total_environ_tax",
+    "main__total_nights_spent",
+    "main__transport_environ_tax",
+    "main__turnover",
+    "temp__Tmax",
+    "temp__Tmin",
+    "tourism__tourism_units_share",
+    "tourism__tourism_turnover_share",
+    "tourism__tourism_employment_share",
+    "tourism__tourism_gdp_share"
+  ]
+}
